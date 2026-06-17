@@ -1,0 +1,11 @@
+fastapi
+uvicorn[standard]
+chromadb
+sentence-transformers
+anthropic
+groq
+python-dotenv
+pydantic
+networkx
+matplotlib
+psycopg2-binary
