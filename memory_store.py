@@ -167,3 +167,36 @@ def retrieve_memories(
     # Step 4: Return the list of text strings.
     # If the query matched nothing (e.g. userId has no memories), return empty list.
     return documents if documents else []
+
+
+def get_all_memories(userId: str) -> List[dict]:
+    """
+    Return every memory stored for a user, ordered oldest-first.
+
+    Each item contains the memory text, role, sessionId, and timestamp
+    so the caller gets full context, not just the text strings.
+    """
+    total_docs = _collection.count()
+    if total_docs == 0:
+        return []
+
+    results = _collection.get(
+        where={"userId": userId},
+        include=["documents", "metadatas"],
+    )
+
+    documents = results.get("documents") or []
+    metadatas = results.get("metadatas") or []
+
+    memories = [
+        {
+            "text": doc,
+            "role": meta.get("role", ""),
+            "sessionId": meta.get("sessionId", ""),
+            "timestamp": meta.get("timestamp", 0),
+        }
+        for doc, meta in zip(documents, metadatas)
+    ]
+
+    memories.sort(key=lambda m: m["timestamp"])
+    return memories

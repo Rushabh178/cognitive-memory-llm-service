@@ -258,6 +258,25 @@ async def retrieve_memory_endpoint(
         raise HTTPException(status_code=503, detail=f"Memory retrieval unavailable: {str(e)}")
 
 
+# ================================================================
+# ENDPOINT: GET /memory/all/{userId}
+# Returns every memory stored for a user, ordered oldest-first.
+# ================================================================
+@app.get("/memory/all/{userId}")
+async def get_all_memories_endpoint(
+    userId: str,
+    authorization: Optional[str] = Header(default=None),
+):
+    require_auth(authorization)
+    logger.info(f"get_all_memories  userId={userId}")
+    try:
+        memories = memory_store.get_all_memories(userId)
+        return {"userId": userId, "count": len(memories), "memories": memories}
+    except Exception as e:
+        logger.error(f"get_all_memories failed: {e}")
+        raise HTTPException(status_code=503, detail=f"Memory retrieval unavailable: {str(e)}")
+
+
 async def process_graph_background(
     userId: str,
     text: str,

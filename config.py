@@ -30,8 +30,8 @@ load_dotenv()
 GROQ_API_KEY: str = os.getenv("GROQ_API_KEY", "")
 
 # Which Groq model to use.
-# llama-3.1-8b-instant is fast and free-tier friendly.
-GROQ_MODEL: str = os.getenv("GROQ_MODEL", "llama-3.1-8b-instant")
+# gpt-oss-20b replaces the deprecated llama-3.1-8b-instant (decommissioned Aug 16 2026).
+GROQ_MODEL: str = os.getenv("GROQ_MODEL", "gpt-oss-20b")
 
 # LLM_MODEL is an alias for GROQ_MODEL so the rest of the codebase
 # (main.py log line, ai_service.py call) can reference a single name.

@@ -9,3 +9,4 @@ pydantic
 networkx
 matplotlib
 psycopg2-binary
+psycopg2
