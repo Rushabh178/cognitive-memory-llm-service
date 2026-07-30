@@ -252,17 +252,21 @@ async def store_memory_endpoint(
         ]
         stored_ids = await asyncio.gather(*store_tasks)
 
-        # Graph processing is scheduled after storage completes so each
-        # background task's node_id lines up with the same fact index.
+        # Graph processing is scheduled after storage completes. Each
+        # background task is handed the SAME id store_memory() just
+        # returned for that fact — not a freshly synthesized one — so the
+        # graph node this creates stays in sync with its ChromaDB document
+        # (the contract process_memory_intent()'s memoryId param and
+        # graph_routes.py's integration guide both assume). This also lets
+        # the background task patch that exact ChromaDB document's metadata
+        # once domain is known (see process_graph_background).
         if body.role == "user":
-            timestamp = int(time.time())
             for index, fact in enumerate(facts):
-                node_id = f"{body.userId}_{timestamp}_{index}"
                 background_tasks.add_task(
                     process_graph_background,
                     body.userId,
                     fact,
-                    node_id,
+                    stored_ids[index],
                 )
 
         # Step 5: Return success response with every generated ID.
@@ -302,6 +306,15 @@ async def retrieve_memory_endpoint(
         # "close vectors = similar meaning" comparisons make sense.
         query_embedding = embeddings.encode(query)
 
+        # Step 2b: Classify which domain (if any) this query is about, using
+        # the same embedding-centroid classifier extract_graph_metadata()
+        # uses at write time — never the LLM fallback, since that would add
+        # LLM latency to every retrieval call. A low-confidence/no-match
+        # result (None) means "search across all domains", same as before
+        # domain filtering existed.
+        from graph_memory import classify_domain_by_embedding
+        query_domain = classify_domain_by_embedding(query, body.userId)
+
         # Step 3 & 4: Search ChromaDB for the most similar memories.
         # The where={"userId": ...} filter inside retrieve_memories() ensures
         # we ONLY return memories belonging to this specific user.
@@ -309,6 +322,7 @@ async def retrieve_memory_endpoint(
             userId=body.userId,
             query_embedding=query_embedding,
             topK=body.topK,
+            domain=query_domain,
         )
 
         # Step 5 & 6: Return the memories list.
@@ -415,6 +429,15 @@ async def process_graph_background(
                 f"userId={userId} reason=non-declarative text"
             )
             return
+
+        # Patch the domain this extraction just resolved onto the ChromaDB
+        # entry for THIS memory_id — not result["node_id"], which for
+        # action="updated" is an older, matched graph node, not the fact we
+        # just stored. This is what makes the memory domain-filterable in
+        # retrieve_memories(); it wasn't known yet when store_memory() wrote
+        # it, since that call happens before this background task runs.
+        domain = metadata.get("domain", "general")
+        memory_store.update_memory_domain(memory_id, domain)
 
         # We're already running off the main request/response path (this
         # function only runs after the chat response has been sent), so a

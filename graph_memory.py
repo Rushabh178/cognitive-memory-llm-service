@@ -27,6 +27,7 @@ import logging
 from datetime import datetime
 from typing import Dict, List, Any, Optional
 
+import numpy as np
 import psycopg2
 import psycopg2.extras
 from psycopg2 import pool as pg_pool
@@ -34,6 +35,7 @@ from psycopg2.extras import RealDictCursor
 
 import config
 import ai_service
+import embeddings
 from ai_service import _client as _groq_client
 
 logger = logging.getLogger(__name__)
@@ -49,6 +51,34 @@ RELEVANCE_THRESHOLD = 0.45
 # instead of minting a new one (e.g. "job_search" should resolve to "career"
 # if "career" already exists).
 DOMAIN_MATCH_THRESHOLD = 0.80
+
+# Minimum cosine similarity between a new memory's embedding and an existing
+# domain's centroid embedding for classify_domain_by_embedding() to use that
+# domain directly, skipping resolve_domain() (and its LLM call) entirely.
+#
+# CALIBRATION STATUS: an early smoke test using hand-written, first-person
+# test sentences ("I have an exam next week...") scored suspiciously low and
+# even inverted (same-domain lower than different-domain) — but that test
+# fed the classifier text in a different style from what it ever sees in
+# production. Every stored memory is rewritten by atomic_extractor.py into a
+# short, third-person fact ("He works at Yardi") BEFORE extract_graph_metadata()
+# ever runs, so that's the only distribution classify_domain_by_embedding()
+# needs to work well on. Re-tested against the 2026-07-30 backfill
+# (backfill_legacy_domains.py) using real third-person atomic facts, 18/33
+# legacy memories cleared 0.70 confidently (many at 0.79-1.00). Caveat: most
+# of those 18 already had an identical/near-identical text already filed
+# under that domain in graph_nodes (graph processing had already run for
+# them despite the id-mismatch bug fixed alongside this), which likely
+# inflates those specific scores via self-similarity — that inflation can't
+# happen for genuinely new text at normal write time, but it also means this
+# backfill run isn't strong accuracy evidence either way. A real, still-open
+# risk: classify_domain_by_embedding() is also used at QUERY time (see
+# /memory/retrieve in main.py) on raw natural-language queries, which are
+# NOT third-person atomic facts — a train/inference distribution mismatch
+# that write-time classification doesn't have. Keep logging every call's
+# top score (see classify_domain_by_embedding()) and watch real query-time
+# scores specifically before trusting this threshold for retrieval.
+DOMAIN_CLASSIFIER_THRESHOLD = 0.70
 
 # Minimum LLM-judged confidence that new text is about the same logical task
 # as an existing "ongoing" node, for find_matching_task_node() to treat them
@@ -76,7 +106,17 @@ CONFLICT_RESOLUTION_TRIGGER_LIMIT = 20
 # finished the interview") scored 0.71 — both under their thresholds. LLM
 # judgment via ai_service handles this kind of reasoning-based matching
 # (paraphrase, completion-of-the-same-task) far better than raw embedding
-# distance, so both functions ask the LLM directly instead.
+# distance, so both functions ask the LLM directly instead. The same reasoning
+# applies to _cluster_nodes_via_llm() below (which resolve_conflicting_nodes()
+# depends on) — it's clustering by the same kind of paraphrase/completion
+# judgment, not content similarity.
+#
+# classify_domain_by_embedding() below is NOT a violation of this finding: it
+# embeds MEMORY TEXT and compares to other memory text (content similarity),
+# never a domain LABEL string compared to another label string. It only
+# replaces resolve_domain()'s LLM call as a pre-check inside
+# extract_graph_metadata() — resolve_domain(), find_matching_task_node(), and
+# _cluster_nodes_via_llm() themselves are untouched and still LLM-only.
 
 
 # ================================================================
@@ -339,6 +379,112 @@ def _call_fast_llm(prompt: str) -> str:
 
 
 # ================================================================
+# FUNCTION 0: classify_domain_by_embedding
+# ================================================================
+
+def classify_domain_by_embedding(text: str, userId: str) -> Optional[str]:
+    """
+    Fast, LLM-free alternative to resolve_domain() for the common case of
+    tagging a new memory with one of this user's existing domains.
+
+    See the CALIBRATION STATUS note on DOMAIN_CLASSIFIER_THRESHOLD above —
+    reasonably confident on write-time (atomic-fact) text, still unvalidated
+    on query-time (natural-language) text.
+
+    For each of the user's existing domains, computes the centroid (mean)
+    of the sentence-transformer embeddings of every graph_nodes.text already
+    tagged with that domain, then compares `text`'s own embedding to each
+    centroid by cosine similarity.
+
+    This is a different signal from resolve_domain()'s already-tried-and-
+    failed embedding approach (see the NOTE near the top of this file):
+    that compared domain LABEL strings to label strings ("job_search" vs
+    "career" scored 0.39). This compares memory CONTENT to memory content —
+    whether a new paragraph reads like the other paragraphs already filed
+    under a domain, which is a much stronger signal.
+
+    Returns the matched domain if the top similarity clears
+    DOMAIN_CLASSIFIER_THRESHOLD, so the caller can skip resolve_domain()
+    (and its LLM call) entirely. Returns None — meaning "fall back to
+    resolve_domain()" — when this user has no existing domains yet, when
+    nothing clears the threshold, or on any embedding/DB failure.
+
+    Every call logs its top domain and score, even below-threshold ones,
+    so a batch of real classifications can be reviewed to retune the 0.70
+    cutoff empirically — the same way RELEVANCE_THRESHOLD was tuned.
+    """
+    conn = _get_connection()
+    try:
+        cur = conn.cursor()
+        cur.execute(
+            """
+            SELECT domain, text FROM graph_nodes
+            WHERE user_id = %s AND superseded_by IS NULL
+              AND text IS NOT NULL AND text != ''
+            """,
+            (userId,),
+        )
+        rows = cur.fetchall()
+        cur.close()
+    except Exception as e:
+        logger.warning(
+            f"classify_domain_by_embedding failed to fetch nodes userId={userId}: {e}"
+        )
+        return None
+    finally:
+        _release_connection(conn)
+
+    texts_by_domain: Dict[str, List[str]] = {}
+    for row in rows:
+        d = row["domain"]
+        if d:
+            texts_by_domain.setdefault(d, []).append(row["text"])
+
+    if not texts_by_domain:
+        return None
+
+    try:
+        all_texts = [t for texts in texts_by_domain.values() for t in texts]
+        all_vectors = np.array(embeddings.encode_batch(all_texts))
+
+        centroids: Dict[str, np.ndarray] = {}
+        offset = 0
+        for domain, texts in texts_by_domain.items():
+            n = len(texts)
+            centroids[domain] = all_vectors[offset:offset + n].mean(axis=0)
+            offset += n
+
+        query_vector = np.array(embeddings.encode(text))
+        query_norm = np.linalg.norm(query_vector)
+        if query_norm == 0:
+            return None
+
+        best_domain, best_score = None, -1.0
+        for domain, centroid in centroids.items():
+            centroid_norm = np.linalg.norm(centroid)
+            if centroid_norm == 0:
+                continue
+            score = float(np.dot(query_vector, centroid) / (query_norm * centroid_norm))
+            if score > best_score:
+                best_domain, best_score = domain, score
+    except Exception as e:
+        logger.warning(
+            f"classify_domain_by_embedding failed to embed/score userId={userId}: {e}"
+        )
+        return None
+
+    logger.info(
+        f"classify_domain_by_embedding userId={userId} top_domain={best_domain!r} "
+        f"score={best_score:.3f} threshold={DOMAIN_CLASSIFIER_THRESHOLD} "
+        f"text={text[:80]!r}"
+    )
+
+    if best_domain is not None and best_score >= DOMAIN_CLASSIFIER_THRESHOLD:
+        return best_domain
+    return None
+
+
+# ================================================================
 # FUNCTION 1: extract_graph_metadata
 # ================================================================
 
@@ -379,7 +525,12 @@ def extract_graph_metadata(text: str, userId: str) -> dict:
         parsed: Dict[str, Any] = safe_parse_json(raw)
 
         domain = str(parsed.get("domain", "general")).lower().strip() or "general"
-        domain = resolve_domain(domain, userId)
+        # Try the cheap embedding classifier first — if this memory's content
+        # clearly clusters with an existing domain, use it directly and skip
+        # resolve_domain()'s LLM call. Only fall back to resolve_domain() (the
+        # LLM-guessed candidate above) when the classifier isn't confident.
+        classified_domain = classify_domain_by_embedding(text, userId)
+        domain = classified_domain if classified_domain else resolve_domain(domain, userId)
 
         status = str(parsed.get("status", "ongoing")).lower()
         if status not in ("ongoing", "completed"):

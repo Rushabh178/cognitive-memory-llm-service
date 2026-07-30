@@ -38,7 +38,7 @@ import chromadb
 import logging
 import uuid
 import time
-from typing import List
+from typing import List, Optional
 import config
 
 logger = logging.getLogger(__name__)
@@ -137,6 +137,7 @@ def retrieve_memories(
     userId: str,
     query_embedding: List[float],
     topK: int,
+    domain: Optional[str] = None,
 ) -> List[str]:
     """
     Find the most semantically similar memories for a given user.
@@ -148,6 +149,16 @@ def retrieve_memories(
         userId:          Only return memories belonging to this user.
         query_embedding: The vector of the current search query text.
         topK:            How many results to return (e.g. 5 = top 5 matches).
+        domain:          If given, restrict results to memories tagged with
+                          this domain (see graph_memory.classify_domain_by_embedding,
+                          which the /memory/retrieve endpoint uses to classify
+                          the query before calling this). Memories stored
+                          before domain tagging existed, or whose background
+                          graph processing hasn't patched a domain onto them
+                          yet, won't match a domain filter — pass None
+                          (the default) to search across all of a user's
+                          memories regardless of domain, same as before this
+                          parameter existed.
 
     Returns:
         A list of text strings (the stored memory documents), ordered from
@@ -176,16 +187,22 @@ def retrieve_memories(
     #   future reference but are conversational text, not facts about the
     #   user, so they must never be injected back as retrieval context.
     #   The userId filter is the privacy boundary: no user ever sees
-    #   another user's memories.
+    #   another user's memories. domain is added only when the caller passed
+    #   one — most memories don't have it backfilled/patched onto them yet,
+    #   so an unconditional domain clause would silently exclude them.
+    where_clause = {
+        "$and": [
+            {"userId": {"$eq": userId}},
+            {"role": {"$eq": "user"}},
+        ]
+    }
+    if domain:
+        where_clause["$and"].append({"domain": {"$eq": domain}})
+
     results = _collection.query(
         query_embeddings=[query_embedding],
         n_results=effective_n_results,
-        where={
-            "$and": [
-                {"userId": {"$eq": userId}},
-                {"role": {"$eq": "user"}},
-            ]
-        },
+        where=where_clause,
     )
 
     # Step 3: Extract the document and distance arrays from ChromaDB's response.
@@ -210,6 +227,33 @@ def retrieve_memories(
     # Step 5: Return at most topK of the filtered results.
     # If nothing passed the threshold (or the user has no memories), return empty list.
     return filtered_docs[:topK]
+
+
+def update_memory_domain(memory_id: str, domain: str) -> bool:
+    """
+    Patch the `domain` field onto an already-stored ChromaDB entry.
+
+    Domain isn't known at store_memory() time — it's determined afterward by
+    the LLM/classifier-based graph extraction pipeline, which runs as a
+    background task so it never blocks the /memory/store response. This is
+    called once that background task resolves a domain, so the memory
+    becomes domain-filterable in retrieve_memories() shortly after — not
+    immediately — after it's stored.
+
+    ChromaDB's collection.update() merges the given metadata keys into the
+    existing metadata dict rather than replacing it wholesale, so userId/
+    sessionId/role/timestamp are left untouched.
+
+    Returns True if the update was applied, False on failure (never raises —
+    this runs off the main request/response path via a background task, and
+    a failure here must not surface as an error anywhere).
+    """
+    try:
+        _collection.update(ids=[memory_id], metadatas=[{"domain": domain}])
+        return True
+    except Exception as e:
+        logger.warning(f"update_memory_domain failed memoryId={memory_id}: {e}")
+        return False
 
 
 def delete_user_memories(userId: str) -> int:
