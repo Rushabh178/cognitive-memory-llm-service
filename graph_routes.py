@@ -22,7 +22,7 @@
 import logging
 from typing import Optional
 
-from fastapi import APIRouter, Header, HTTPException
+from fastapi import APIRouter, BackgroundTasks, Header, HTTPException
 
 import config
 import graph_memory
@@ -68,6 +68,7 @@ def _require_auth(authorization: Optional[str]) -> None:
 @router.post("/process", response_model=GraphProcessResponse)
 async def graph_process_endpoint(
     body: GraphProcessRequest,
+    background_tasks: BackgroundTasks,
     authorization: Optional[str] = Header(default=None),
 ):
     """
@@ -81,33 +82,65 @@ async def graph_process_endpoint(
     logger.info(f"graph_process  userId={body.userId}  memoryId={body.memoryId}")
 
     try:
-        # Step 1: Ask Claude to extract entity name, domain, status, etc.
-        # This is the intelligence step — turning raw text into structured metadata.
-        metadata = graph_memory.extract_graph_metadata(body.text, body.userId)
-
-        # Step 2: Add the node (and auto-generated edges) to the graph.
-        # We use the memoryId as the node_id so ChromaDB and the graph stay in sync.
-        success = graph_memory.add_to_graph(
+        # process_memory_intent() handles the whole pipeline: extracting
+        # metadata via the LLM, then deciding whether this text completes or
+        # duplicates an existing "ongoing" node (update) or is genuinely new
+        # (create). This is what stops e.g. three separate nodes being
+        # created for the same "deploy to AWS" task.
+        result = graph_memory.process_memory_intent(
             userId=body.userId,
-            node_id=body.memoryId,
             text=body.text,
-            metadata=metadata,
+            memoryId=body.memoryId,
         )
 
-        if not success:
+        # The text was a question, not a fact/task — process_memory_intent()
+        # never called the LLM or wrote anything. GraphProcessResponse's
+        # fields are all required (non-Optional) strings/floats, so we fill
+        # placeholders here rather than changing that shared response
+        # contract; status="skipped" + an empty node_id is how Spring Boot
+        # tells "nothing was stored" apart from a real "stored" response.
+        if result["action"] == "skipped":
+            logger.info(f"graph_process skipped  userId={body.userId}  reason=non-declarative text")
+            return GraphProcessResponse(
+                status="skipped",
+                node_id="",
+                entity_name="",
+                domain="",
+                sub_domain="",
+                status_label="",
+                timeline_label="",
+                importance_score=0.0,
+            )
+
+        if not result.get("success"):
             raise HTTPException(
                 status_code=503,
                 detail="Graph store unavailable: failed to write node to disk.",
             )
 
-        # Step 3: Return the structured metadata so Spring Boot can log or display it.
+        metadata = result["metadata"]
+        node_id = result["node_id"]
+
+        # A brand-new node was just written — schedule a cheap, domain-scoped
+        # conflict-resolution pass as a background task so it never delays
+        # this response. Only "created" needs this: "updated" already went
+        # through the write-time dedup check, so it can't have just
+        # introduced a new duplicate.
+        if result["action"] == "created":
+            background_tasks.add_task(
+                graph_memory.resolve_conflicting_nodes,
+                body.userId,
+                metadata.get("domain", "general"),
+                graph_memory.CONFLICT_RESOLUTION_TRIGGER_LIMIT,
+            )
+
         logger.info(
-            f"graph_process complete  userId={body.userId}  "
-            f"entity={metadata.get('entity_name')}  domain={metadata.get('domain')}"
+            f"graph_process complete  userId={body.userId}  action={result['action']}  "
+            f"nodeId={node_id}  entity={metadata.get('entity_name')}  domain={metadata.get('domain')}"
         )
         return GraphProcessResponse(
             status="stored",
-            node_id=body.memoryId,
+            node_id=node_id,
             entity_name=metadata.get("entity_name", ""),
             domain=metadata.get("domain", "general"),
             sub_domain=metadata.get("sub_domain", ""),
@@ -240,6 +273,76 @@ async def graph_status_update_endpoint(
     except Exception as e:
         logger.error(f"graph_status_update failed: {e}")
         raise HTTPException(status_code=503, detail=f"Status update failed: {str(e)}")
+
+
+# ================================================================
+# ENDPOINT 5: GET /graph/all
+# Admin/debug endpoint — returns every memory node stored across
+# ALL users, not scoped to a single userId like the endpoints above.
+# ================================================================
+@router.get("/all")
+async def graph_all_nodes_endpoint(
+    include_archived: bool = False,
+    authorization: Optional[str] = Header(default=None),
+):
+    """
+    Return every stored memory node, across all users.
+
+    Admin/debug view only — the response includes every user's raw memory
+    text in one payload, so it is gated behind the same Bearer token as
+    every other /graph endpoint. Not intended for per-user frontend use;
+    use GET /graph/timeline/{userId} or POST /graph/context for that.
+
+    include_archived=true also includes nodes that were merged into
+    another node by resolve_conflicting_nodes() (superseded_by IS NOT NULL).
+    """
+    _require_auth(authorization)
+    logger.info(f"graph_all_nodes  include_archived={include_archived}")
+
+    try:
+        nodes = graph_memory.get_all_nodes(include_archived=include_archived)
+        return {"count": len(nodes), "nodes": nodes}
+
+    except Exception as e:
+        logger.error(f"graph_all_nodes failed: {e}")
+        raise HTTPException(status_code=503, detail=f"Fetching all nodes failed: {str(e)}")
+
+
+# ================================================================
+# ENDPOINT 6: DELETE /graph/{userId}
+# Clears one user's graph data ONLY (nodes + edges), leaving their
+# ChromaDB vector memories untouched. Use DELETE /memory/{userId}
+# in main.py instead when both stores need to be cleared together.
+# ================================================================
+@router.delete("/{userId}")
+async def graph_clear_endpoint(
+    userId: str,
+    authorization: Optional[str] = Header(default=None),
+):
+    """
+    Delete every graph_nodes and graph_edges row for a single user.
+
+    The safe, in-place alternative to running raw SQL or deleting files —
+    no other user's data is touched and no server restart is needed.
+    """
+    _require_auth(authorization)
+    logger.info(f"graph_clear  userId={userId}")
+
+    try:
+        result = graph_memory.delete_user_graph(userId)
+        logger.info(
+            f"graph_clear complete  userId={userId}  "
+            f"nodesDeleted={result['nodes_deleted']}  edgesDeleted={result['edges_deleted']}"
+        )
+        return {
+            "userId": userId,
+            "graphNodesDeleted": result["nodes_deleted"],
+            "graphEdgesDeleted": result["edges_deleted"],
+        }
+
+    except Exception as e:
+        logger.error(f"graph_clear failed userId={userId}: {e}")
+        raise HTTPException(status_code=503, detail=f"Graph clear failed: {str(e)}")
 
 
 # ================================================================

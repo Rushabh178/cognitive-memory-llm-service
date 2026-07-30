@@ -35,10 +35,13 @@
 # ============================================================
 
 import chromadb
+import logging
 import uuid
 import time
 from typing import List
 import config
+
+logger = logging.getLogger(__name__)
 
 # ---------------------------------------------------------------
 # Initialise the ChromaDB client ONCE at module load time.
@@ -58,6 +61,22 @@ _client = chromadb.PersistentClient(path=config.CHROMA_PERSIST_PATH)
 # This means we never accidentally wipe data on restart.
 # ---------------------------------------------------------------
 _collection = _client.get_or_create_collection(name="memories")
+
+# ---------------------------------------------------------------
+# Relevance threshold for retrieve_memories().
+#
+# IMPORTANT: this collection was created without an explicit
+# `metadata={"hnsw:space": "cosine"}`, so Chroma is using its default
+# distance space (squared L2), NOT cosine distance — despite "lower
+# distance = more similar" still holding true either way. A cosine-style
+# threshold like 0.7 does NOT apply here: it would reject every result,
+# including strong matches. This value was calibrated empirically against
+# the live collection — semantically related pairs measured ~1.4-1.8,
+# unrelated pairs measured ~1.8-2.1. If the collection is ever recreated
+# with cosine space and normalized embeddings, this threshold must be
+# re-tuned (a cosine-appropriate value would be far smaller, e.g. ~0.7).
+# ---------------------------------------------------------------
+RELEVANCE_THRESHOLD = 1.8
 
 
 def store_memory(
@@ -143,30 +162,73 @@ def retrieve_memories(
         # No memories stored at all — return empty list, not an error.
         return []
 
-    # Cap topK so we never ask for more results than exist in the collection.
-    # e.g. if only 2 memories are stored and topK=5, ask for 2.
-    effective_top_k = min(topK, total_docs)
+    # Request topK * 2 candidates (capped at the actual collection size) so
+    # there's a pool to filter down by relevance below — otherwise, filtering
+    # out weak matches would silently shrink results below topK even when
+    # better matches exist further down the ranking.
+    effective_n_results = min(topK * 2, total_docs)
 
     # Step 2: Query ChromaDB.
     # - query_embeddings: the vector we're searching for similar entries to
-    # - n_results: how many matches to return
-    # - where: metadata filter — ONLY return memories for this specific userId
-    #   This is the privacy boundary: no user ever sees another user's memories.
+    # - n_results: how many candidates to fetch (before relevance filtering)
+    # - where: metadata filter — ONLY return memories for this specific userId,
+    #   and ONLY role="user" memories. Assistant responses are stored for
+    #   future reference but are conversational text, not facts about the
+    #   user, so they must never be injected back as retrieval context.
+    #   The userId filter is the privacy boundary: no user ever sees
+    #   another user's memories.
     results = _collection.query(
         query_embeddings=[query_embedding],
-        n_results=effective_top_k,
-        where={"userId": userId},
+        n_results=effective_n_results,
+        where={
+            "$and": [
+                {"userId": {"$eq": userId}},
+                {"role": {"$eq": "user"}},
+            ]
+        },
     )
 
-    # Step 3: Extract the document strings from ChromaDB's response.
+    # Step 3: Extract the document and distance arrays from ChromaDB's response.
     # ChromaDB returns a dict with keys: "ids", "documents", "metadatas", "distances".
-    # results["documents"] is a list of lists (one list per query — we sent one query).
-    # So results["documents"][0] is the list of matching text strings for our query.
+    # Each is a list of lists (one list per query — we sent one query), so index [0]
+    # gets the results for our single query, ordered most-to-least similar.
     documents = results.get("documents", [[]])[0]
+    distances = results.get("distances", [[]])[0]
 
-    # Step 4: Return the list of text strings.
-    # If the query matched nothing (e.g. userId has no memories), return empty list.
-    return documents if documents else []
+    # Step 4: Filter out weak matches — a memory is only relevant context if
+    # it's actually close to the query, not just the least-bad option available.
+    filtered_docs = [
+        doc for doc, dist in zip(documents, distances)
+        if dist < RELEVANCE_THRESHOLD
+    ]
+
+    logger.info(
+        f"Retrieved {len(filtered_docs)} relevant memories from "
+        f"{len(documents)} candidates userId={userId}"
+    )
+
+    # Step 5: Return at most topK of the filtered results.
+    # If nothing passed the threshold (or the user has no memories), return empty list.
+    return filtered_docs[:topK]
+
+
+def delete_user_memories(userId: str) -> int:
+    """
+    Delete every memory belonging to a single user from ChromaDB.
+
+    Unlike deleting the chroma_data folder directly, this runs against the
+    live collection while the server keeps serving other users — no file
+    locks, no restart, and every other user's data is untouched.
+
+    Returns the number of memories deleted (0 if the user had none).
+    """
+    existing = _collection.get(where={"userId": userId}, include=[])
+    ids = existing.get("ids") or []
+    if not ids:
+        return 0
+
+    _collection.delete(where={"userId": userId})
+    return len(ids)
 
 
 def get_all_memories(userId: str) -> List[dict]:

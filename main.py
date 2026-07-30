@@ -18,19 +18,27 @@
 # HTTP request → main.py (auth + routing) → memory_store / ai_service → HTTP response
 # ============================================================
 
+from multiprocessing import context
+import asyncio
 import time
 import logging
+from concurrent.futures import ThreadPoolExecutor
 from contextlib import asynccontextmanager
 
+from click import prompt
 from fastapi import FastAPI, Request, HTTPException, Header, BackgroundTasks
 from fastapi.responses import JSONResponse
 from typing import Optional
+from matplotlib.style import context
+
+from typer import prompt
 
 import config
 import embeddings
 import memory_store
 import ai_service
 import graph_routes
+from atomic_extractor import extract_atomic_facts, is_fact_worth_storing
 from models import (
     MemoryStoreRequest,
     MemoryStoreResponse,
@@ -51,6 +59,15 @@ logging.basicConfig(
     format="%(asctime)s [%(levelname)s] %(message)s",
 )
 logger = logging.getLogger(__name__)
+
+# ---------------------------------------------------------------
+# Thread pool for running sync ChromaDB writes (memory_store.store_memory)
+# concurrently. ChromaDB's client is sync, so each store call blocks a
+# thread — running the per-fact stores in parallel here means storing 3
+# atomic facts costs roughly one write's worth of wall time instead of
+# three sequential ones.
+# ---------------------------------------------------------------
+_store_executor = ThreadPoolExecutor(max_workers=4)
 
 
 # ---------------------------------------------------------------
@@ -174,6 +191,7 @@ def require_auth(authorization: Optional[str]) -> None:
 @app.post("/memory/store", response_model=MemoryStoreResponse)
 async def store_memory_endpoint(
     body: MemoryStoreRequest,
+    background_tasks: BackgroundTasks,
     authorization: Optional[str] = Header(default=None),
 ):
     # Auth: reject any request without a valid Bearer token
@@ -183,29 +201,75 @@ async def store_memory_endpoint(
     logger.info(f"store_memory  userId={body.userId}  role={body.role}")
 
     try:
-        # Step 1: Take the text field from the request body.
-        # This is the raw message content we want to remember.
-        text = body.text
+        # Step 1: Split compound user statements into individual atomic facts
+        # ("My name is Rushabh and I work at Yardi" → two facts) so each one
+        # can be retrieved precisely later instead of pulling in a whole
+        # sentence to get part of it. Assistant responses are stored verbatim
+        # — they're conversational text, not a set of facts to decompose.
+        if body.role == "user":
+            facts = extract_atomic_facts(body.text)
 
-        # Step 2: Convert the text into a vector using the embedding model.
-        # The vector captures the semantic meaning of the text so we can
-        # search for similar memories later using vector similarity.
-        embedding = embeddings.encode(text)
+            # Filter out low-quality fragments that survived extraction —
+            # too short to carry meaning on their own, or meta-cognitive
+            # statements about the conversation rather than facts about the user.
+            facts = [f for f in facts if is_fact_worth_storing(f)]
 
-        # Step 3 & 4 & 5: Store the text, embedding, and metadata in ChromaDB.
-        # memory_store.store_memory() generates the unique ID internally and
-        # returns it so we can include it in the response.
-        memory_id = memory_store.store_memory(
-            userId=body.userId,
-            sessionId=body.sessionId or "",
-            text=text,
-            role=body.role,
-            embedding=embedding,
+            if not facts:
+                logger.info(
+                    f"All atomic facts filtered out "
+                    f"for userId={body.userId} — nothing stored"
+                )
+                return MemoryStoreResponse(status="filtered", ids=[], facts_count=0)
+
+            logger.info(
+                f"Storing {len(facts)} facts after filtering "
+                f"for userId={body.userId}: {facts}"
+            )
+        else:
+            facts = [body.text]
+
+        # Step 2: Embed every fact in a single batched model call — much
+        # faster than calling embeddings.encode() once per fact, since the
+        # model parallelises internally across the batch.
+        embeddings_list = embeddings.encode_batch(facts)
+
+        # Step 3 & 4: Store each fact as its own ChromaDB entry. ChromaDB's
+        # client is sync, so run the N stores concurrently on a thread pool
+        # instead of blocking on them one at a time.
+        loop = asyncio.get_running_loop()
+        store_tasks = [
+            loop.run_in_executor(
+                _store_executor,
+                lambda f=fact, e=embedding: memory_store.store_memory(
+                    userId=body.userId,
+                    sessionId=body.sessionId or "",
+                    text=f,
+                    role=body.role,
+                    embedding=e,
+                ),
+            )
+            for fact, embedding in zip(facts, embeddings_list)
+        ]
+        stored_ids = await asyncio.gather(*store_tasks)
+
+        # Graph processing is scheduled after storage completes so each
+        # background task's node_id lines up with the same fact index.
+        if body.role == "user":
+            timestamp = int(time.time())
+            for index, fact in enumerate(facts):
+                node_id = f"{body.userId}_{timestamp}_{index}"
+                background_tasks.add_task(
+                    process_graph_background,
+                    body.userId,
+                    fact,
+                    node_id,
+                )
+
+        # Step 5: Return success response with every generated ID.
+        logger.info(
+            f"Memory stored  userId={body.userId}  facts_count={len(stored_ids)}  ids={stored_ids}"
         )
-
-        # Step 5: Return success response with the generated ID.
-        logger.info(f"Memory stored  id={memory_id}")
-        return MemoryStoreResponse(status="stored", id=memory_id)
+        return MemoryStoreResponse(status="stored", ids=stored_ids, facts_count=len(stored_ids))
 
     except Exception as e:
         # Step 6: Return 503 if anything fails (ChromaDB down, model error, etc.)
@@ -250,6 +314,7 @@ async def retrieve_memory_endpoint(
         # Step 5 & 6: Return the memories list.
         # An empty list is a valid result (user has no memories yet) — not an error.
         logger.info(f"Retrieved {len(memories)} memories for userId={body.userId}")
+        logger.info(f"DEBUG retrieved_memories userId={body.userId} texts={memories!r}")
         return MemoryRetrieveResponse(memories=memories)
 
     except Exception as e:
@@ -277,14 +342,54 @@ async def get_all_memories_endpoint(
         raise HTTPException(status_code=503, detail=f"Memory retrieval unavailable: {str(e)}")
 
 
+# ================================================================
+# ENDPOINT: DELETE /memory/{userId}
+# Clears one user's data from BOTH stores (ChromaDB + graph DB) in
+# place, without touching any other user's data or requiring a
+# server restart — the safe alternative to deleting chroma_data by
+# hand while the server is running.
+# ================================================================
+@app.delete("/memory/{userId}")
+async def clear_memory_endpoint(
+    userId: str,
+    authorization: Optional[str] = Header(default=None),
+):
+    require_auth(authorization)
+    logger.info(f"clear_memory  userId={userId}")
+
+    try:
+        vector_deleted = memory_store.delete_user_memories(userId)
+
+        from graph_memory import delete_user_graph
+        graph_result = delete_user_graph(userId)
+        graph_deleted = graph_result["nodes_deleted"]
+
+        logger.info(
+            f"clear_memory complete  userId={userId}  "
+            f"vectorMemoriesDeleted={vector_deleted}  "
+            f"graphNodesDeleted={graph_deleted}  "
+            f"graphEdgesDeleted={graph_result['edges_deleted']}"
+        )
+
+        return {
+            "userId": userId,
+            "vectorMemoriesDeleted": vector_deleted,
+            "graphNodesDeleted": graph_deleted,
+        }
+
+    except Exception as e:
+        logger.error(f"clear_memory failed userId={userId}: {e}")
+        raise HTTPException(status_code=503, detail=f"Clearing memory failed: {str(e)}")
+
+
 async def process_graph_background(
     userId: str,
     text: str,
     memory_id: str
 ) -> None:
     """
-    Runs after the chat response is already sent to user.
-    Extracts graph metadata and stores the node.
+    Runs after the /memory/store response is already sent to the caller, once
+    per atomic fact. Extracts graph metadata and stores the node.
     Failure here never affects the user.
     """
     try:
@@ -293,17 +398,39 @@ async def process_graph_background(
             f"userId={userId} memoryId={memory_id}"
         )
         from graph_memory import (
-            extract_graph_metadata,
-            add_to_graph
+            process_memory_intent,
+            resolve_conflicting_nodes,
+            CONFLICT_RESOLUTION_TRIGGER_LIMIT,
         )
 
-        metadata = extract_graph_metadata(text, userId)
+        result = process_memory_intent(userId, text, memory_id)
+        metadata = result["metadata"]
 
-        add_to_graph(userId, memory_id, text, metadata)
+        # process_memory_intent() runs the is_declarative() gate itself
+        # before ever calling the LLM — a question never gets extracted or
+        # stored. Nothing left to do here for that case.
+        if result["action"] == "skipped":
+            logger.info(
+                f"Background graph processing skipped "
+                f"userId={userId} reason=non-declarative text"
+            )
+            return
+
+        # We're already running off the main request/response path (this
+        # function only runs after the chat response has been sent), so a
+        # direct await here adds no latency the user can see. Only "created"
+        # can have just introduced a new duplicate — "updated" already went
+        # through the write-time dedup check.
+        if result["action"] == "created":
+            await resolve_conflicting_nodes(
+                userId,
+                metadata.get("domain", "general"),
+                CONFLICT_RESOLUTION_TRIGGER_LIMIT,
+            )
 
         logger.info(
             f"Background graph processing complete "
-            f"userId={userId} "
+            f"userId={userId} action={result['action']} "
             f"domain={metadata.get('domain', 'unknown')} "
             f"status={metadata.get('status', 'unknown')}"
         )
@@ -319,11 +446,13 @@ async def process_graph_background(
 # ENDPOINT 3: POST /ai/chat
 # Sends the user's message to Claude, injecting retrieved memories
 # as context so the AI can give personalised, memory-aware responses.
+# Graph processing for the user's message happens separately, per atomic
+# fact, when /memory/store is called — not here, to avoid graph-processing
+# the same statement twice (once whole, once split into facts).
 # ================================================================
 @app.post("/ai/chat", response_model=AiChatResponse)
 async def ai_chat_endpoint(
     body: AiChatRequest,
-    background_tasks: BackgroundTasks,
     authorization: Optional[str] = Header(default=None),
 ):
     # Auth: reject any request without a valid Bearer token
@@ -334,6 +463,7 @@ async def ai_chat_endpoint(
         f"ai_chat  userId={body.userId}  "
         f"context={'yes' if has_context else 'no'}"
     )
+    logger.info(f"DEBUG ai_chat_full_context userId={body.userId} context={body.context!r}")
 
     try:
         # Step 1 & 2: build_system_prompt() inside call_llm() checks whether
@@ -341,26 +471,13 @@ async def ai_chat_endpoint(
 
         # Step 3: Call the Anthropic Claude API with the message and context.
         # ai_service.call_llm() handles prompt construction and the API call.
+
         answer = ai_service.call_llm(
             message=body.message,
             context=body.context,
         )
 
         logger.info(f"ai_chat response generated for userId={body.userId}")
-
-        memory_id = f"{body.userId}_{int(time.time())}"
-
-        background_tasks.add_task(
-            process_graph_background,
-            body.userId,
-            body.message,
-            memory_id
-        )
-
-        logger.info(
-            f"Graph processing scheduled as background task "
-            f"memoryId={memory_id}"
-        )
 
         return AiChatResponse(answer=answer)
 
@@ -397,9 +514,9 @@ async def health_endpoint():
 
     graph_status = "ok"
     try:
-        from graph_memory import _get_connection
+        from graph_memory import _get_connection, _release_connection
         conn = _get_connection()
-        conn.close()
+        _release_connection(conn)
     except Exception as e:
         logger.warning(f"Health: graph DB error: {e}")
         graph_status = "error"

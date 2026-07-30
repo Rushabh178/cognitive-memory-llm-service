@@ -79,10 +79,11 @@ def call_llm(message: str, context: str) -> str:
     """
     system_prompt = build_system_prompt(context)
 
-    logger.info(
-        f"call_llm → model={config.LLM_MODEL} "
-        f"context={'yes' if context.strip() else 'no'}"
-    )
+    logger.info("========== SYSTEM PROMPT ==========")
+    logger.info(system_prompt)
+    logger.info("========== USER MESSAGE ==========")
+    logger.info(message)
+    logger.info("==================================")
 
     # temperature controls creativity: 0.7 is a good balance
     # for conversational AI — not too robotic, not too random.

@@ -10,3 +10,4 @@ networkx
 matplotlib
 psycopg2-binary
 psycopg2
+redis

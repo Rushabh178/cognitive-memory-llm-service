@@ -37,6 +37,12 @@ GROQ_MODEL: str = os.getenv("GROQ_MODEL", "gpt-oss-20b")
 # (main.py log line, ai_service.py call) can reference a single name.
 LLM_MODEL: str = GROQ_MODEL
 
+# Smaller/cheaper Groq model used for structured extraction tasks (JSON
+# metadata extraction, atomic fact splitting) that don't need the large
+# model's reasoning capacity — only ai/chat's conversational response
+# keeps using LLM_MODEL.
+FAST_LLM_MODEL: str = os.getenv("FAST_LLM_MODEL", "llama-3.1-8b-instant")
+
 # Maximum number of tokens the LLM is allowed to generate in one response.
 # 1024 tokens ≈ 750 words — plenty for conversational replies.
 LLM_MAX_TOKENS: int = int(os.getenv("LLM_MAX_TOKENS", "1024"))
@@ -55,6 +61,13 @@ CHROMA_PERSIST_PATH: str = os.getenv("CHROMA_PERSIST_PATH", "./chroma_data")
 # The sentence-transformers model used to convert text into vectors.
 # all-MiniLM-L6-v2 is small (80 MB), fast, and good enough for semantic search.
 EMBEDDING_MODEL: str = os.getenv("EMBEDDING_MODEL", "all-MiniLM-L6-v2")
+
+# --- Redis embedding cache (optional) ---
+# Disabled by default. When disabled or unreachable, embeddings.encode()
+# just computes fresh every time — no functional loss, only a speed cost.
+REDIS_HOST: str = os.getenv("REDIS_HOST", "localhost")
+REDIS_PORT: int = int(os.getenv("REDIS_PORT", "6379"))
+REDIS_ENABLED: bool = os.getenv("REDIS_ENABLED", "false").lower() == "true"
 
 # --- Graph memory settings ---
 

@@ -36,11 +36,14 @@ class MemoryStoreRequest(BaseModel):
 class MemoryStoreResponse(BaseModel):
     """
     Data returned after a memory is successfully stored.
-    Lets the caller confirm the store happened and track the generated ID.
+    A single "user" role request may be split into multiple atomic facts,
+    each stored as its own ChromaDB entry — so the response returns every
+    generated ID, not just one.
     """
 
     status: str          # Always "stored" on success
-    id: str              # The unique ID assigned to this memory in ChromaDB
+    ids: List[str]       # The unique ID(s) assigned to each stored fact in ChromaDB
+    facts_count: int     # How many atomic facts were stored (1 for assistant messages)
 
 
 class MemoryRetrieveRequest(BaseModel):
