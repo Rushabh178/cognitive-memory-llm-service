@@ -66,16 +66,31 @@ class MemoryRetrieveResponse(BaseModel):
     memories: List[str]  # The actual text of the matching memories, ordered by similarity
 
 
+class ChatTurn(BaseModel):
+    """
+    One prior message from the CURRENT session, sent by Spring Boot so the
+    LLM sees the running conversation as real prior turns — not as text
+    flattened into the context blob. See AiChatRequest.sessionHistory.
+    """
+
+    role: str             # "user" or "assistant" — anything else is dropped, see ai_service.call_llm()
+    content: str          # The message text, verbatim
+
+
 class AiChatRequest(BaseModel):
     """
     Data the caller sends when asking the AI to respond to a user message.
-    The context field contains pre-retrieved memories that will be injected
-    into the AI's system prompt.
+    The context field contains pre-retrieved LONG-TERM memory (ChromaDB +
+    graph_context_text + the rolling summary) that will be injected into the
+    AI's system prompt as background/supporting context only. sessionHistory
+    is the CURRENT conversation and takes priority over it — see
+    ai_service.build_system_prompt() for how that priority is enforced.
     """
 
     userId: str          # Identifies the user (used for logging, not for retrieval here)
     message: str         # The user's current message to respond to
-    context: str         # Memories already retrieved and joined into a single string
+    context: str         # Long-term memory context, already retrieved and joined into a single string
+    sessionHistory: List[ChatTurn] = []  # Prior turns of THIS session, oldest first
 
 
 class AiChatResponse(BaseModel):

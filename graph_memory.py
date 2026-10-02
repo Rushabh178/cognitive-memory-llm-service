@@ -46,10 +46,49 @@ logger = logging.getLogger(__name__)
 # relevant memories are being dropped (lower it).
 RELEVANCE_THRESHOLD = 0.45
 
-# Minimum LLM-judged confidence that a candidate domain is the same life-area
-# as an existing domain, for resolve_domain() to reuse the existing one
-# instead of minting a new one (e.g. "job_search" should resolve to "career"
-# if "career" already exists).
+# Fixed set of top-level life areas. `domain` must be one of these. Anything
+# more specific belongs in the free-form `sub_domain` column, e.g.
+# domain="hobbies", sub_domain="favorite cricket players". Previously
+# `domain` itself was free-form (LLM-invented, merged after the fact by
+# embedding and LLM similarity). That let related but distinct areas drift
+# into one bucket, and near-synonyms ("sports", "favorite things") pile up
+# as separate top-level domains. See resolve_domain() for the migration
+# note on existing free-form data.
+TOP_LEVEL_DOMAINS = [
+    "job", "education", "hobbies", "health", "finance",
+    "relationships", "travel", "food", "general",
+]
+
+# Cheap, deterministic mapping of common free-form labels onto
+# TOP_LEVEL_DOMAINS, tried by resolve_domain() before it spends an LLM call.
+# Also covers labels an older free-form run produced, which helps a
+# backfill of existing data.
+_DOMAIN_ALIASES = {
+    "career": "job", "work": "job", "job_search": "job", "employment": "job",
+    "study": "education", "studies": "education", "learning": "education",
+    "school": "education", "college": "education", "university": "education",
+    "hobby": "hobbies", "sport": "hobbies", "sports": "hobbies",
+    "entertainment": "hobbies", "music": "hobbies", "games": "hobbies",
+    "fitness": "health", "medical": "health", "wellness": "health",
+    "money": "finance", "investment": "finance", "investments": "finance",
+    "relationship": "relationships", "family": "relationships",
+    "friends": "relationships", "social": "relationships",
+    "trip": "travel", "trips": "travel",
+    "diet": "food", "cooking": "food",
+}
+
+# Edge strength = EDGE_SIMILARITY_WEIGHT * cosine(text_a, text_b)
+#               + (1 - EDGE_SIMILARITY_WEIGHT) * heuristic
+# The heuristic is the old flat per-relationship value. It stands for the
+# same-domain + same-month co-occurrence signal that made the two nodes
+# edge candidates in the first place.
+EDGE_SIMILARITY_WEIGHT = 0.5
+EDGE_HEURISTIC_LED_TO = 0.7
+EDGE_HEURISTIC_RELATED_TO = 0.6
+
+# Minimum LLM-judged confidence for resolve_domain() to map a stray,
+# out-of-set label onto one of TOP_LEVEL_DOMAINS (e.g. "job_search" -> "job").
+# Below this it falls back to "general".
 DOMAIN_MATCH_THRESHOLD = 0.80
 
 # Minimum cosine similarity between a new memory's embedding and an existing
@@ -246,11 +285,46 @@ def initialize_tables() -> None:
         "ALTER TABLE graph_nodes ADD COLUMN IF NOT EXISTS last_accessed_at TIMESTAMP DEFAULT NOW()",
         "ALTER TABLE graph_nodes ADD COLUMN IF NOT EXISTS superseded_by VARCHAR REFERENCES graph_nodes(id)",
         "ALTER TABLE graph_nodes ADD COLUMN IF NOT EXISTS archived_at TIMESTAMP",
+        # NULL means "not yet folded into a user_summaries row". Set by
+        # summarization.generate_user_summary() in the same transaction as
+        # the INSERT into user_summaries — see that function for why.
+        "ALTER TABLE graph_nodes ADD COLUMN IF NOT EXISTS summarized_at TIMESTAMP",
+        # Why a node was archived: 'revision' (a fact slot got a new value —
+        # the old node is history, see supersede_node()) or 'merge' (a
+        # duplicate folded in by resolve_conflicting_nodes()). NULL on active
+        # nodes and on nodes archived before this column existed.
+        "ALTER TABLE graph_nodes ADD COLUMN IF NOT EXISTS supersede_reason VARCHAR",
+        # TRUE when the node was written from fallback metadata (extraction
+        # failed: unsplit whole message and/or default classification).
+        # Such nodes skip matching and merging, and are excluded as match/merge
+        # candidates, until a backfill pass reprocesses them with a real
+        # extraction. See process_memory_intent().
+        "ALTER TABLE graph_nodes ADD COLUMN IF NOT EXISTS needs_reprocessing BOOLEAN DEFAULT FALSE",
+        "CREATE INDEX IF NOT EXISTS idx_graph_nodes_needs_reprocessing "
+        "ON graph_nodes(user_id) WHERE needs_reprocessing",
         "CREATE INDEX IF NOT EXISTS idx_graph_nodes_user_id ON graph_nodes(user_id)",
         "CREATE INDEX IF NOT EXISTS idx_graph_nodes_domain   ON graph_nodes(domain)",
         "CREATE INDEX IF NOT EXISTS idx_graph_nodes_superseded_by ON graph_nodes(superseded_by)",
         "CREATE INDEX IF NOT EXISTS idx_graph_nodes_last_accessed ON graph_nodes(last_accessed_at)",
+        "CREATE INDEX IF NOT EXISTS idx_graph_nodes_summarized_at ON graph_nodes(summarized_at)",
         "CREATE INDEX IF NOT EXISTS idx_graph_edges_source   ON graph_edges(source_node_id)",
+        # Rolling per-user digest generated periodically by
+        # summarization.generate_user_summary() — see that module. Kept out
+        # of graph_nodes entirely: a summary has no domain/status/timeline,
+        # and giving it one of those would mean get_graph_context()'s scoring,
+        # edge-building, and timeline_summary all need to special-case a
+        # synthetic node type.
+        """
+        CREATE TABLE IF NOT EXISTS user_summaries (
+            id                SERIAL PRIMARY KEY,
+            user_id           VARCHAR NOT NULL,
+            summary_text      TEXT NOT NULL,
+            generated_at      TIMESTAMP DEFAULT NOW(),
+            source_node_count INTEGER DEFAULT 0
+        )
+        """,
+        "CREATE INDEX IF NOT EXISTS idx_user_summaries_user_id ON user_summaries(user_id)",
+        "CREATE INDEX IF NOT EXISTS idx_user_summaries_generated_at ON user_summaries(generated_at)",
     ]
 
     conn = _get_connection()
@@ -351,6 +425,7 @@ def is_declarative(text: str) -> bool:
     return True
 
 
+
 # ================================================================
 # UTILITY: _call_fast_llm
 # ================================================================
@@ -384,14 +459,21 @@ def _call_fast_llm(prompt: str) -> str:
 
 def classify_domain_by_embedding(text: str, userId: str) -> Optional[str]:
     """
-    Fast, LLM-free alternative to resolve_domain() for the common case of
-    tagging a new memory with one of this user's existing domains.
+    Fast, LLM-free way to tag text with one of the fixed TOP_LEVEL_DOMAINS,
+    based on which of this user's existing domains it reads most like.
+
+    TWO-TIER MODEL: only the top-level `domain` is classified here, and only
+    into TOP_LEVEL_DOMAINS. Nodes whose stored domain is outside that set
+    (legacy free-form labels) are ignored when building centroids, so this
+    can never return a non-canonical domain. The finer `sub_domain` is
+    free-form and not involved here.
 
     See the CALIBRATION STATUS note on DOMAIN_CLASSIFIER_THRESHOLD above —
     reasonably confident on write-time (atomic-fact) text, still unvalidated
-    on query-time (natural-language) text.
+    on query-time (natural-language) text. With coarser top-level buckets
+    the centroids are broader, so that threshold may need re-tuning.
 
-    For each of the user's existing domains, computes the centroid (mean)
+    For each of the user's existing top-level domains, computes the centroid (mean)
     of the sentence-transformer embeddings of every graph_nodes.text already
     tagged with that domain, then compares `text`'s own embedding to each
     centroid by cosine similarity.
@@ -421,8 +503,9 @@ def classify_domain_by_embedding(text: str, userId: str) -> Optional[str]:
             SELECT domain, text FROM graph_nodes
             WHERE user_id = %s AND superseded_by IS NULL
               AND text IS NOT NULL AND text != ''
+              AND domain = ANY(%s)
             """,
-            (userId,),
+            (userId, TOP_LEVEL_DOMAINS),
         )
         rows = cur.fetchall()
         cur.close()
@@ -495,18 +578,26 @@ def extract_graph_metadata(text: str, userId: str) -> dict:
     Returns a dict with domain, status, importance_score, timeline fields, etc.
     On LLM failure returns safe defaults — never raises.
     """
+    allowed = ", ".join(TOP_LEVEL_DOMAINS)
     prompt = (
         "Analyze this text and extract structured metadata.\n"
         "Return ONLY a JSON object with these exact fields:\n"
         "{\n"
         '  "entity_name": "the main subject/entity in this text",\n'
-        '  "domain": "a short life-area label for this memory (e.g. job, study, health, '
-        'finance, relationship, travel, food, hobby) — invent a new concise label if none fit",\n'
-        '  "sub_domain": "specific subcategory within the domain",\n'
+        f'  "domain": "EXACTLY one of: {allowed}",\n'
+        '  "sub_domain": "a short, specific free-form label within the domain",\n'
         '  "status": "ongoing or completed",\n'
         '  "importance_score": 0.5,\n'
         '  "related_entities": ["list of other entities mentioned"]\n'
         "}\n\n"
+        "Rules for domain and sub_domain:\n"
+        f"- domain MUST be one of: {allowed}. Never invent a new domain.\n"
+        "- Put anything more specific in sub_domain, not in domain. "
+        'e.g. favorite cricket player -> domain "hobbies", sub_domain '
+        '"favorite cricket players"; DSA prep for an interview -> domain '
+        '"job", sub_domain "interview preparation"; a course or exam -> '
+        'domain "education".\n'
+        '- Use "general" only if none of the others fit.\n\n'
         "Rules for status:\n"
         '- "completed": finished/done/passed/failed/got/received/quit\n'
         '- "ongoing": preparing/studying/working/applying/waiting\n'
@@ -521,16 +612,43 @@ def extract_graph_metadata(text: str, userId: str) -> dict:
     )
 
     try:
-        raw = _call_fast_llm(prompt)
-        parsed: Dict[str, Any] = safe_parse_json(raw)
+        parsed: Dict[str, Any] = safe_parse_json(_call_fast_llm(prompt))
+    except Exception as e:
+        logger.warning(
+            f"extract_graph_metadata failed for userId={userId}: {e} — using defaults"
+        )
+        metadata = normalize_graph_metadata({}, text, userId)
+        # Defaults are not a real classification — process_memory_intent()
+        # must not match or supersede on them.
+        metadata["extraction_failed"] = True
+        return metadata
+    return normalize_graph_metadata(parsed, text, userId)
 
+
+def normalize_graph_metadata(parsed: Optional[Dict[str, Any]], text: str, userId: str) -> dict:
+    """
+    Validate raw metadata from an LLM and fill in the rest: resolve the
+    domain into TOP_LEVEL_DOMAINS, clamp status/importance, default missing
+    fields, stamp the timeline.
+
+    Used by extract_graph_metadata() (its own single-fact LLM call) and by
+    process_memory_intent() when the caller already has metadata from
+    atomic_extractor.extract_facts_with_metadata(), which classifies all of
+    a message's facts in one call. Both paths therefore get identical
+    validation. Never raises; `parsed` may be None or {} (→ safe defaults).
+    """
+    parsed = parsed if isinstance(parsed, dict) else {}
+    failed = False
+    try:
         domain = str(parsed.get("domain", "general")).lower().strip() or "general"
-        # Try the cheap embedding classifier first — if this memory's content
-        # clearly clusters with an existing domain, use it directly and skip
-        # resolve_domain()'s LLM call. Only fall back to resolve_domain() (the
-        # LLM-guessed candidate above) when the classifier isn't confident.
-        classified_domain = classify_domain_by_embedding(text, userId)
-        domain = classified_domain if classified_domain else resolve_domain(domain, userId)
+        # The prompt forces a TOP_LEVEL_DOMAINS value, so a valid answer is
+        # used as-is — no extra embedding pass or LLM call. Only when the LLM
+        # strays outside the fixed set: try the cheap embedding classifier
+        # (which also only returns fixed-set domains), then resolve_domain()
+        # to map the stray label onto the set.
+        if domain not in TOP_LEVEL_DOMAINS:
+            classified_domain = classify_domain_by_embedding(text, userId)
+            domain = classified_domain if classified_domain else resolve_domain(domain, userId)
 
         status = str(parsed.get("status", "ongoing")).lower()
         if status not in ("ongoing", "completed"):
@@ -549,8 +667,9 @@ def extract_graph_metadata(text: str, userId: str) -> dict:
 
     except Exception as e:
         logger.warning(
-            f"extract_graph_metadata failed for userId={userId}: {e} — using defaults"
+            f"normalize_graph_metadata failed for userId={userId}: {e} — using defaults"
         )
+        failed = True
         domain = "general"
         status = "ongoing"
         importance = 0.5
@@ -558,10 +677,10 @@ def extract_graph_metadata(text: str, userId: str) -> dict:
         parsed = {}
 
     now = datetime.now()
-    return {
-        "entity_name": str(parsed.get("entity_name", text[:60])),
+    result = {
+        "entity_name": str(parsed.get("entity_name") or text[:60]),
         "domain": domain,
-        "sub_domain": str(parsed.get("sub_domain", "")),
+        "sub_domain": str(parsed.get("sub_domain") or ""),
         "status": status,
         "importance_score": importance,
         "related_entities": related,
@@ -569,6 +688,9 @@ def extract_graph_metadata(text: str, userId: str) -> dict:
         "timeline_month": now.month,
         "timeline_label": now.strftime("%B %Y"),
     }
+    if failed:
+        result["extraction_failed"] = True
+    return result
 
 
 # ================================================================
@@ -577,75 +699,131 @@ def extract_graph_metadata(text: str, userId: str) -> dict:
 
 def resolve_domain(candidate_domain: str, userId: str) -> str:
     """
-    Resolve an LLM-suggested domain against this user's existing domains.
+    Map a candidate domain label onto the fixed TOP_LEVEL_DOMAINS set.
 
-    Domains are no longer restricted to a fixed set — the LLM can invent any
-    label. To stop near-duplicates piling up over time (e.g. "job_search" vs
-    "career"), this reuses an existing domain when it's a close semantic
-    match, and only mints a new domain label when nothing close already
-    exists.
+    TWO-TIER MODEL: `domain` is one of TOP_LEVEL_DOMAINS (coarse, fixed);
+    `sub_domain` is free-form (fine-grained). Previously this function
+    merged the candidate against whatever free-form domains the user
+    already had, which let the set of top-level domains grow and drift.
+    It now always returns a TOP_LEVEL_DOMAINS value:
+      1. candidate already in the set -> return it
+      2. candidate in _DOMAIN_ALIASES -> return the mapped domain (no LLM)
+      3. ask the LLM to pick the best-fitting top-level domain; accept it
+         if it's in the set and confidence >= DOMAIN_MATCH_THRESHOLD
+      4. otherwise -> "general"
+    `userId` is kept for signature compatibility and logging only.
 
-    Returns the resolved domain (always lowercased/stripped).
+    MIGRATION NOTE (existing non-empty data): nodes and Chroma entries
+    written before this change can carry free-form domains ("career",
+    "sports", "favorite things", ...). They keep working for display
+    (timeline, summaries), but they are effectively invisible to anything
+    that filters on the fixed set:
+      - classify_domain_by_embedding() skips them when building centroids,
+      - find_matching_task_node() only compares nodes with the SAME domain,
+        so a new "hobbies" fact can't match/revise a legacy "sports" node,
+      - the /memory/retrieve domain filter won't return legacy-tagged
+        Chroma entries once the query classifies into a fixed domain.
+    To backfill, run a one-off pass in the spirit of
+    backfill_legacy_domains.py: for every graph_nodes row whose domain is not
+    in TOP_LEVEL_DOMAINS, compute new = resolve_domain(old_domain, user_id).
+    Where the old label was more specific than the new domain and sub_domain
+    is empty, move the old label into sub_domain so the finer distinction
+    isn't lost. UPDATE graph_nodes.domain, then call
+    memory_store.update_memory_domain(node_id, new) for the Chroma entry with
+    the same id. Resolve each DISTINCT old label once and reuse the result:
+    there are far fewer distinct labels than nodes. Afterwards, consider a
+    full resolve_conflicting_nodes(userId, limit=None) sweep, since merging
+    buckets can expose duplicates that used to sit in different domains.
+
+    Returns the resolved domain (always one of TOP_LEVEL_DOMAINS).
     """
     candidate = candidate_domain.lower().strip() or "general"
 
-    conn = _get_connection()
-    try:
-        cur = conn.cursor()
-        cur.execute(
-            "SELECT DISTINCT domain FROM graph_nodes WHERE user_id = %s",
-            (userId,),
-        )
-        existing = [row["domain"] for row in cur.fetchall() if row["domain"]]
-        cur.close()
-    except Exception as e:
-        logger.error(f"resolve_domain failed to fetch existing domains userId={userId}: {e}")
-        return candidate
-    finally:
-        _release_connection(conn)
-
-    if not existing:
+    if candidate in TOP_LEVEL_DOMAINS:
         return candidate
 
-    if candidate in existing:
-        return candidate
+    if candidate in _DOMAIN_ALIASES:
+        resolved = _DOMAIN_ALIASES[candidate]
+        logger.info(f"resolve_domain userId={userId} alias '{candidate}' -> '{resolved}'")
+        return resolved
 
     prompt = (
-        "A memory-tagging system is assigning a life-area label to a new memory.\n\n"
-        f'NEW CANDIDATE LABEL: "{candidate}"\n\n'
-        "EXISTING LABELS already used for this same user:\n"
-        + "\n".join(f'- "{d}"' for d in existing) + "\n\n"
-        "If the NEW CANDIDATE LABEL refers to essentially the same life-area as one "
-        "of the EXISTING LABELS (e.g. \"job_search\" and \"career\" are the same "
-        "area; \"gym\" and \"sport\" are the same area), return that existing label "
-        "exactly as written. Otherwise, if it's a genuinely different area, return "
-        "the NEW CANDIDATE LABEL unchanged.\n\n"
+        "A memory-tagging system must file a label under exactly one fixed "
+        "top-level life-area.\n\n"
+        f'CANDIDATE LABEL: "{candidate}"\n\n'
+        "ALLOWED TOP-LEVEL DOMAINS:\n"
+        + "\n".join(f'- "{d}"' for d in TOP_LEVEL_DOMAINS) + "\n\n"
+        "Pick the one allowed domain the candidate label belongs under "
+        '(e.g. "job_search" -> "job", "gym" -> "health", "cricket" -> '
+        '"hobbies"). Use "general" only if nothing else fits.\n\n'
         "Return ONLY a JSON object:\n"
-        '{"resolved_domain": "<an existing label, or the new candidate label>", '
-        '"confidence": 0.0}\n'
+        '{"resolved_domain": "<one of the allowed domains>", "confidence": 0.0}\n'
         "confidence is how sure you are that resolved_domain is correct (1.0 = certain).\n"
         "No explanation. No markdown."
     )
 
     try:
-        raw = ai_service.call_llm(message=prompt, context="")
+        raw = ai_service.call_llm(message=prompt, context="", temperature=0, for_chat=False)
         parsed = safe_parse_json(raw)
-        resolved = str(parsed.get("resolved_domain", candidate)).lower().strip()
+        resolved = str(parsed.get("resolved_domain", "general")).lower().strip()
         confidence = float(parsed.get("confidence", 0.0))
     except Exception as e:
         logger.warning(
-            f"resolve_domain LLM match failed userId={userId}: {e} — using raw candidate"
+            f"resolve_domain LLM mapping failed userId={userId}: {e} — using 'general'"
         )
-        return candidate
+        return "general"
 
-    if resolved in existing and confidence >= DOMAIN_MATCH_THRESHOLD:
+    if resolved in TOP_LEVEL_DOMAINS and confidence >= DOMAIN_MATCH_THRESHOLD:
         logger.info(
-            f"resolve_domain userId={userId} matched '{candidate}' -> "
+            f"resolve_domain userId={userId} mapped '{candidate}' -> "
             f"'{resolved}' (confidence={confidence:.2f})"
         )
         return resolved
 
-    return candidate
+    logger.info(
+        f"resolve_domain userId={userId} could not confidently map '{candidate}' "
+        f"(got {resolved!r} confidence={confidence:.2f}) — using 'general'"
+    )
+    return "general"
+
+
+# ================================================================
+# HELPER: _text_similarities (edge strength input)
+# ================================================================
+
+def _text_similarities(text: str, others: List[str]) -> List[Optional[float]]:
+    """
+    Cosine similarity between `text` and each string in `others`, using the
+    same sentence-transformer as the rest of the codebase (embeddings.py).
+
+    Negative cosines are clamped to 0.0 so the result stays in [0, 1] and can
+    be blended with the [0, 1] heuristic edge weight.
+
+    Returns one value per input, in order. Any element is None when it can't be
+    scored (empty text, zero vector, or an embedding failure). The caller then
+    falls back to the heuristic weight alone, so edge creation never fails
+    because of embeddings.
+    """
+    if not others:
+        return []
+    try:
+        base = np.array(embeddings.encode(text))
+        base_norm = np.linalg.norm(base)
+        vectors = embeddings.encode_batch([o or " " for o in others])
+    except Exception as e:
+        logger.warning(f"_text_similarities embedding failed: {e} — using heuristic strength only")
+        return [None] * len(others)
+
+    results: List[Optional[float]] = []
+    for other, vec in zip(others, vectors):
+        v = np.array(vec)
+        v_norm = np.linalg.norm(v)
+        if not other.strip() or base_norm == 0 or v_norm == 0:
+            results.append(None)
+            continue
+        cosine = float(np.dot(base, v) / (base_norm * v_norm))
+        results.append(max(0.0, min(1.0, cosine)))
+    return results
 
 
 # ================================================================
@@ -657,10 +835,19 @@ def add_to_graph(
     node_id: str,
     text: str,
     metadata: dict,
+    exclude_related_ids: Optional[List[str]] = None,
 ) -> bool:
     """
+    exclude_related_ids: node ids that must not get an edge from this node,
+    e.g. the node a revision is about to supersede. superseded_by already
+    links the two, and a RELATED_TO edge to it would be noise.
     Insert a new node into graph_nodes and create edges to related
     existing nodes (same domain + same month).
+
+    Relationship type: LED_TO when this node completes something that was
+    ongoing, otherwise RELATED_TO. Strength is computed per edge: the text
+    cosine similarity blended with the co-occurrence heuristic (see
+    EDGE_SIMILARITY_WEIGHT). Every created edge's strength is logged.
 
     Returns True on success, False on failure.
     """
@@ -674,8 +861,8 @@ def add_to_graph(
             INSERT INTO graph_nodes (
                 id, user_id, entity_name, domain, sub_domain,
                 status, timeline_year, timeline_month, timeline_label,
-                importance_score, text, created_at, last_updated
-            ) VALUES (%s, %s, %s, %s, %s, %s, %s, %s, %s, %s, %s, NOW(), NOW())
+                importance_score, text, needs_reprocessing, created_at, last_updated
+            ) VALUES (%s, %s, %s, %s, %s, %s, %s, %s, %s, %s, %s, %s, NOW(), NOW())
             ON CONFLICT (id) DO UPDATE SET
                 last_updated = NOW(),
                 status = EXCLUDED.status
@@ -692,16 +879,17 @@ def add_to_graph(
                 metadata.get("timeline_label", ""),
                 metadata.get("importance_score", 0.5),
                 text,
+                bool(metadata.get("needs_reprocessing", False)),
             ),
         )
 
         # Find existing nodes in the same domain + same calendar month
         cur.execute(
             """
-            SELECT id, status
+            SELECT id, status, text
             FROM graph_nodes
             WHERE user_id = %s
-              AND id != %s
+              AND id <> ALL(%s)
               AND domain = %s
               AND timeline_year = %s
               AND timeline_month = %s
@@ -710,7 +898,7 @@ def add_to_graph(
             """,
             (
                 userId,
-                node_id,
+                [node_id] + list(exclude_related_ids or []),
                 metadata.get("domain", "general"),
                 metadata.get("timeline_year"),
                 metadata.get("timeline_month"),
@@ -718,12 +906,25 @@ def add_to_graph(
         )
         related_nodes = cur.fetchall()
 
+        similarities = _text_similarities(text, [r["text"] or "" for r in related_nodes])
+
         new_status = metadata.get("status", "ongoing")
-        for related in related_nodes:
+        edges_created = 0
+        for related, similarity in zip(related_nodes, similarities):
+            # Relationship TYPE is still decided by status; only strength is computed.
             if new_status == "completed" and related["status"] == "ongoing":
-                relationship, strength = "LED_TO", 0.7
+                relationship, heuristic = "LED_TO", EDGE_HEURISTIC_LED_TO
             else:
-                relationship, strength = "RELATED_TO", 0.6
+                relationship, heuristic = "RELATED_TO", EDGE_HEURISTIC_RELATED_TO
+
+            if similarity is None:
+                strength = heuristic
+            else:
+                strength = (
+                    EDGE_SIMILARITY_WEIGHT * similarity
+                    + (1 - EDGE_SIMILARITY_WEIGHT) * heuristic
+                )
+            strength = round(strength, 4)
 
             # Insert edge only if it doesn't already exist
             cur.execute(
@@ -744,12 +945,19 @@ def add_to_graph(
                     node_id, related["id"],
                 ),
             )
+            if cur.rowcount > 0:
+                edges_created += 1
+                sim_label = f"{similarity:.4f}" if similarity is not None else "n/a"
+                logger.info(
+                    f"Edge created userId={userId} {node_id} -[{relationship}]-> {related['id']} "
+                    f"strength={strength:.4f} (cosine={sim_label} heuristic={heuristic})"
+                )
 
         conn.commit()
         cur.close()
         logger.info(
             f"Graph node stored userId={userId} nodeId={node_id} "
-            f"edges={len(related_nodes)}"
+            f"edges_created={edges_created} candidates={len(related_nodes)}"
         )
         return True
 
@@ -1009,6 +1217,146 @@ def get_graph_context(userId: str, query_text: str, topN: int = 5) -> dict:
         _release_connection(conn)
 
 
+
+# ================================================================
+# FUNCTION 3A: revision history for history-flavoured questions
+# ================================================================
+
+HISTORY_CONTEXT_LIMIT = 5
+
+
+def get_revision_history(
+    userId: str, domain: Optional[str] = None, limit: int = HISTORY_CONTEXT_LIMIT
+) -> List[dict]:
+    """
+    The user's revised fact slots, as chains of values: for each slot that
+    has been revised at least once, the previous values (oldest first) and
+    the current one.
+
+    A scoped companion to get_timeline_summary(): it reads the same archived
+    nodes, but follows only supersede_reason='revision' links (merges are
+    duplicates, not history). It returns only the `limit` most recently
+    changed slots, optionally within one domain, so a history question
+    doesn't pull the user's entire history into the prompt.
+
+    Returns [{"domain", "slot", "previous": [value, ...], "current": value,
+              "last_changed": datetime}], most recently changed first.
+    """
+    conn = _get_connection()
+    try:
+        cur = conn.cursor()
+        cur.execute(
+            """
+            SELECT id, entity_name, text, domain, sub_domain,
+                   superseded_by, supersede_reason, archived_at
+            FROM graph_nodes WHERE user_id = %s
+            """,
+            (userId,),
+        )
+        rows = {r["id"]: r for r in cur.fetchall()}
+        cur.close()
+    except Exception as e:
+        logger.error(f"get_revision_history failed userId={userId}: {e}")
+        return []
+    finally:
+        _release_connection(conn)
+
+    def label(r):
+        return (r["entity_name"] or r["text"] or "").strip()
+
+    def terminal(node_id):
+        # Follow superseded_by (any reason) to the node that is active now.
+        seen = set()
+        while rows.get(node_id) and rows[node_id]["superseded_by"] and node_id not in seen:
+            seen.add(node_id)
+            node_id = rows[node_id]["superseded_by"]
+        return node_id
+
+    chains: Dict[str, List[dict]] = {}
+    for r in rows.values():
+        if r["supersede_reason"] == "revision" and r["superseded_by"]:
+            head = terminal(r["id"])
+            if head in rows and not rows[head]["superseded_by"]:
+                chains.setdefault(head, []).append(r)
+
+    out = []
+    for head_id, previous in chains.items():
+        head = rows[head_id]
+        if domain and head["domain"] != domain:
+            continue
+        previous.sort(key=lambda r: r["archived_at"] or datetime.min)
+        out.append({
+            "domain": head["domain"] or "general",
+            "slot": head["sub_domain"] or previous[-1]["sub_domain"] or "",
+            "previous": [label(r) for r in previous],
+            "current": label(head),
+            "last_changed": previous[-1]["archived_at"],
+        })
+    out.sort(key=lambda c: c["last_changed"] or datetime.min, reverse=True)
+    return out[:limit]
+
+
+def format_history_context(chains: List[dict]) -> str:
+    """
+    Render revision chains as bullet lines, one per changed fact slot:
+      "- Favorite cricket players: previously Rohit Sharma, replaced by Virat Kohli (current)"
+
+    No heading: the caller (Spring's SessionController) labels the section,
+    the same way it labels every other context section.
+    """
+    lines = []
+    for c in chains:
+        slot = (c["slot"] or c["domain"]).strip()
+        slot = slot[:1].upper() + slot[1:]
+        lines.append(
+            f"- {slot}: previously {', then '.join(c['previous'])}, "
+            f"replaced by {c['current']} (current)"
+        )
+    return "\n".join(lines)
+
+
+def get_history_context(
+    userId: str,
+    query_text: Optional[str] = None,
+    domain: Optional[str] = None,
+    limit: int = HISTORY_CONTEXT_LIMIT,
+) -> dict:
+    """
+    Bounded revision history for a history-flavoured question. Served by
+    GET /graph/history/{userId}; Spring calls it only when its
+    HistoryQuestionUtil flags the message ("who did I use to like before
+    that?"). get_graph_context() stays current-state only.
+
+    Scope, in order:
+      1. `domain` if the caller gave one;
+      2. else the domain of `query_text`, if classify_domain_by_embedding()
+         is confident;
+      3. if that finds nothing (or neither applies): the `limit` most
+         recently changed slots across all domains. An anaphoric question
+         ("…before that?") usually has no domain signal of its own, so
+         "recent" beats returning nothing.
+
+    Always bounded by `limit` and by revision chains only — never the full
+    timeline, which grows without limit.
+
+    Returns {"domain": <scope used or None>, "chains": [...],
+             "history_context_text": <bullet lines, "" if none>}.
+    """
+    scope = domain
+    if not scope and query_text:
+        scope = classify_domain_by_embedding(query_text, userId)
+
+    chains = get_revision_history(userId, domain=scope, limit=limit) if scope else []
+    if not chains:
+        scope = None
+        chains = get_revision_history(userId, limit=limit)
+
+    logger.info(
+        f"get_history_context userId={userId} domain_scope={scope!r} chains={len(chains)}"
+    )
+    return {"domain": scope, "chains": chains, "history_context_text": format_history_context(chains)}
+
+
 # ================================================================
 # FUNCTION 3B: get_stale_nodes
 # ================================================================
@@ -1084,6 +1432,169 @@ def update_node_status(userId: str, node_id: str, new_status: str) -> bool:
         _release_connection(conn)
 
 
+# ================================================================
+# FUNCTION 4B: update_node_content
+# ================================================================
+
+def update_node_content(
+    userId: str,
+    node_id: str,
+    new_text: str,
+    new_entity_name: str,
+    new_metadata: dict,
+) -> bool:
+    """
+    Overwrite an existing node's content in place: text, entity_name,
+    domain, sub_domain, importance_score, last_updated.
+
+    Only for an ONGOING TASK mentioned again with new detail ("still
+    applying to Amazon, finished the OA") — the same task, so an in-place
+    edit is right. A revised FACT ("favorite player is now Virat Kohli") must
+    NOT come here: the old value is history, not a mistake, so it goes
+    through supersede_node() instead, which keeps both nodes.
+
+    Status is deliberately not changed here.
+
+    The old -> new text is logged on every call so a revision is always
+    visible in the logs.
+
+    Returns True if the node was found and updated, False otherwise.
+    """
+    conn = _get_connection()
+    try:
+        cur = conn.cursor()
+        cur.execute(
+            "SELECT text FROM graph_nodes WHERE id = %s AND user_id = %s",
+            (node_id, userId),
+        )
+        row = cur.fetchone()
+        if not row:
+            cur.close()
+            logger.warning(
+                f"update_node_content userId={userId} nodeId={node_id} not found — nothing updated"
+            )
+            return False
+        old_text = row["text"]
+
+        cur.execute(
+            """
+            UPDATE graph_nodes
+            SET text = %s,
+                entity_name = %s,
+                domain = %s,
+                sub_domain = %s,
+                importance_score = %s,
+                last_updated = NOW()
+            WHERE id = %s AND user_id = %s
+            """,
+            (
+                new_text,
+                new_entity_name,
+                new_metadata.get("domain", "general"),
+                new_metadata.get("sub_domain", ""),
+                new_metadata.get("importance_score", 0.5),
+                node_id,
+                userId,
+            ),
+        )
+        updated = cur.rowcount > 0
+        conn.commit()
+        cur.close()
+        logger.info(
+            f"update_node_content userId={userId} nodeId={node_id} updated={updated} "
+            f"old_text={old_text!r} -> new_text={new_text!r}"
+        )
+        return updated
+
+    except Exception as e:
+        conn.rollback()
+        logger.error(f"update_node_content failed userId={userId} nodeId={node_id}: {e}")
+        return False
+    finally:
+        _release_connection(conn)
+
+
+# ================================================================
+# FUNCTION 4C: supersession (shared by revisions and merges)
+# ================================================================
+
+_SUPERSEDE_REASONS = ("revision", "merge")
+
+
+def _mark_superseded(cur, userId: str, old_ids: List[str], new_id: str, reason: str) -> int:
+    """
+    Archive `old_ids` in favour of `new_id`: superseded_by, archived_at,
+    supersede_reason. Nothing is deleted — every "current state" read path
+    filters `superseded_by IS NULL`, and get_timeline_summary() keeps
+    archived nodes as history.
+
+    The single place this UPDATE lives, used by supersede_node() (reason
+    "revision") and resolve_conflicting_nodes() (reason "merge"). Runs on
+    the caller's cursor; the caller commits. Already-archived nodes are left
+    alone so an existing chain is never re-pointed. Returns rows updated.
+    """
+    if reason not in _SUPERSEDE_REASONS:
+        raise ValueError(f"unknown supersede reason {reason!r}")
+    cur.execute(
+        """
+        UPDATE graph_nodes
+        SET superseded_by = %s, archived_at = NOW(), supersede_reason = %s
+        WHERE id = ANY(%s) AND user_id = %s AND superseded_by IS NULL
+        """,
+        (new_id, reason, old_ids, userId),
+    )
+    return cur.rowcount
+
+
+def supersede_node(userId: str, old_node_id: str, new_node_id: str) -> Optional[Dict[str, str]]:
+    """
+    Record that `new_node_id` holds the NEW value of the fact slot that
+    `old_node_id` held (a "revision" match): archive the old node with
+    supersede_reason='revision', keeping it as history.
+
+    `new_node_id` must already exist (superseded_by is a foreign key), so
+    the caller creates the new node first.
+
+    Returns the old node's {"node_id", "text", "entity_name"} so the caller
+    can report what was replaced, or None if the old node wasn't found or was
+    already archived.
+    """
+    conn = _get_connection()
+    try:
+        cur = conn.cursor()
+        cur.execute(
+            "SELECT text, entity_name FROM graph_nodes WHERE id = %s AND user_id = %s",
+            (old_node_id, userId),
+        )
+        row = cur.fetchone()
+        if not row:
+            cur.close()
+            logger.warning(f"supersede_node userId={userId} old nodeId={old_node_id} not found")
+            return None
+
+        updated = _mark_superseded(cur, userId, [old_node_id], new_node_id, "revision")
+        conn.commit()
+        cur.close()
+        if not updated:
+            logger.warning(
+                f"supersede_node userId={userId} old nodeId={old_node_id} was already archived"
+            )
+            return None
+
+        logger.info(
+            f"supersede_node userId={userId} {old_node_id} -> {new_node_id} "
+            f"old_text={row['text']!r}"
+        )
+        return {"node_id": old_node_id, "text": row["text"] or "", "entity_name": row["entity_name"] or ""}
+
+    except Exception as e:
+        conn.rollback()
+        logger.error(f"supersede_node failed userId={userId} old nodeId={old_node_id}: {e}")
+        return None
+    finally:
+        _release_connection(conn)
+
+
 # Matches entity_names like "the user", "the speaker", "the user's task",
 # "the speaker's request" — generic pronoun/references rather than a real
 # named entity or task. A candidate node with one of these was very likely
@@ -1112,33 +1623,46 @@ def _is_generic_entity_name(name: str) -> bool:
 # FUNCTION 5: find_matching_task_node
 # ================================================================
 
-def find_matching_task_node(userId: str, text: str, domain: str) -> Optional[str]:
+_MATCH_TYPES = ("progression", "revision")
+
+
+def find_matching_task_node(userId: str, text: str, domain: str) -> Optional[Dict[str, Any]]:
     """
     Search this user's existing "ongoing" nodes in the same domain for one
-    that refers to the exact same task, action, or named entity as `text`
-    — not merely one that shares the same domain/life-area.
+    that `text` is an update to — not merely one that shares the same
+    domain/life-area. Two kinds of update are recognised:
 
-    Used to detect when a new message is really an update to an existing
-    task/fact (e.g. "finished the AWS deployment") rather than a brand-new
-    memory — this is what prevents duplicate/contradictory nodes for the
-    same logical task.
+      - "progression": the same TASK reported at a later stage ("applying
+        for the Amazon job" -> "got the Amazon offer"). The node's status
+        may change (ongoing -> completed); its content is the task itself.
+      - "revision": the same single-slot FACT with a new value ("favorite
+        player is Rohit Sharma" -> "favorite player is now Virat Kohli";
+        also job title, phone number, address). The old value is replaced,
+        never kept side by side, and status stays "ongoing".
+
+    The caller (process_memory_intent) uses match_type to choose between
+    update_node_status() and update_node_content().
 
     Candidates whose entity_name is a generic pronoun/reference (e.g. "the
     user", "the speaker's task") are excluded before they ever reach the
     LLM — see _is_generic_entity_name().
 
-    Returns the matching node's id, or None if nothing scores above
-    TASK_MATCH_THRESHOLD (including when there are no eligible candidates).
+    Returns {"node_id", "match_type", "confidence", "sub_domain" (the matched
+    node's)}, or None if nothing
+    scores above TASK_MATCH_THRESHOLD (including when there are no eligible
+    candidates). A missing/unknown match_type from the LLM defaults to
+    "progression", the pre-revision-support behaviour.
     """
     conn = _get_connection()
     try:
         cur = conn.cursor()
         cur.execute(
             """
-            SELECT id, text, entity_name
+            SELECT id, text, entity_name, sub_domain
             FROM graph_nodes
             WHERE user_id = %s AND domain = %s AND status = 'ongoing'
               AND superseded_by IS NULL
+              AND needs_reprocessing IS NOT TRUE
             ORDER BY last_updated DESC
             LIMIT 15
             """,
@@ -1161,58 +1685,93 @@ def find_matching_task_node(userId: str, text: str, domain: str) -> Optional[str
 
     prompt = (
         "You are matching a NEW message against a user's EXISTING ongoing "
-        "tasks/notes to detect if it's an update to the SAME specific task, "
-        "action, or named entity — not just something from the same "
+        "tasks/facts to detect if it's an update to the SAME specific task "
+        "or the SAME specific fact-slot — not just something from the same "
         "general life-area (domain).\n\n"
-        "IMPORTANT: sharing a domain/category (e.g. both being about "
-        '"job") is NOT sufficient for a match. The NEW MESSAGE must refer '
-        "to the exact same underlying task or entity as an EXISTING item. "
-        "A different task, a standing fact, or a question in the same "
-        "domain is NOT a match.\n\n"
+        "There are TWO kinds of match:\n"
+        '1. "progression" — the SAME TASK reported at a different stage. '
+        "The task moves forward (ongoing -> completed).\n"
+        '   e.g. "applying for the Amazon job" -> "got the Amazon offer"\n'
+        '2. "revision" — the SAME single-value FACT SLOT with a NEW value. '
+        "The old value is replaced, not progressed. Typical slots: favorite "
+        "X, current job title, employer, phone number, address, city of "
+        "residence.\n"
+        '   e.g. "favorite player is Rohit Sharma" -> "favorite player is '
+        'now Virat Kohli"\n'
+        '   e.g. "works as a support engineer" -> "was promoted to senior '
+        'developer"\n\n'
+        "IMPORTANT: sharing a domain/category is NOT sufficient for a match. "
+        "The slot must be the same. A NEW MESSAGE that leaves out a qualifier "
+        'still refers to the existing slot ("favorite player is now X" after '
+        '"favorite cricket player is Y" is a revision of the cricket slot). '
+        "Only a DIFFERENT explicit qualifier (football vs cricket) makes it a "
+        "different slot.\n\n"
         "Examples:\n"
-        '- MATCH: "applying for the AWS job" and "got the AWS offer" — '
-        "same task, reported at a different stage.\n"
+        '- MATCH (progression): "applying for the AWS job" and "got the '
+        'AWS offer" — same task, later stage.\n'
+        '- MATCH (revision): "favorite cricket player is Rohit Sharma" and '
+        '"favorite player is now Virat Kohli" — same slot, new value.\n'
+        '- NO MATCH: "favorite cricket player is Virat Kohli" and "favorite '
+        'football player is Messi" — different slots (cricket vs football); '
+        "both values are true at the same time.\n"
         '- NO MATCH: "I\'m a software engineer at Yardi" and "update my '
-        'resume before Friday" — same domain (job), but one is a standing '
-        "fact about the person and the other is a distinct, unrelated "
-        "task. Do not match these.\n"
+        'resume before Friday" — same domain (job), but a standing fact and '
+        "an unrelated task.\n"
         '- NO MATCH: "what are my pending reminders" and "remind me to '
-        'deploy to AWS" — a question is never a match target for a task; '
-        "only match against genuine facts/tasks, never questions.\n\n"
+        'deploy to AWS" — a question is never a match target.\n\n'
         f'NEW MESSAGE: "{text}"\n\n'
-        "EXISTING ITEMS (id: text):\n"
+        "EXISTING ITEMS (id: text [sub_domain]). An item's slot is defined by "
+        "its text AND its sub_domain — a revision can drop a qualifier from "
+        'the text (e.g. "cricket") that the sub_domain still records:\n'
         + "\n".join(
-            f'- {row["id"]}: "{row["text"] or row["entity_name"]}"'
+            f'- {row["id"]}: "{row["text"] or row["entity_name"]}" '
+            f'[{row["sub_domain"] or "-"}]'
             for row in candidates
         ) + "\n\n"
-        "If the NEW MESSAGE is about the exact same underlying task/entity "
-        "as one of the existing items (even if worded very differently), "
-        "return that item's id. Otherwise — including when it's merely in "
-        "the same domain — return matched_id as null.\n\n"
-        'Return ONLY JSON: {"matched_id": "<id or null>", "confidence": 0.0, '
+        "If the NEW MESSAGE is a progression of an existing task or a "
+        "revision of an existing fact slot (even if worded very "
+        "differently), return that item's id and the match_type. Otherwise "
+        "— including when it's merely in the same domain — return "
+        "matched_id as null.\n\n"
+        'Return ONLY JSON: {"matched_id": "<id or null>", '
+        '"match_type": "progression" | "revision" | null, "confidence": 0.0, '
         '"reason": "<one sentence explaining the decision>"}\n'
         "confidence is how sure you are of the match (1.0 = certain).\n"
         "No explanation outside the JSON. No markdown."
     )
 
     try:
-        raw = ai_service.call_llm(message=prompt, context="")
+        raw = ai_service.call_llm(message=prompt, context="", temperature=0, for_chat=False)
         parsed = safe_parse_json(raw)
         matched_id = parsed.get("matched_id")
+        match_type = str(parsed.get("match_type") or "").lower().strip()
         confidence = float(parsed.get("confidence", 0.0))
         reason = str(parsed.get("reason", "")).strip()
     except Exception as e:
         logger.warning(f"find_matching_task_node LLM match failed userId={userId}: {e}")
         return None
 
-    valid_ids = {row["id"] for row in candidates}
-    if matched_id in valid_ids and confidence >= TASK_MATCH_THRESHOLD:
+    if match_type not in _MATCH_TYPES:
+        match_type = "progression"
+
+    by_id = {row["id"]: row for row in candidates}
+    if matched_id in by_id and confidence >= TASK_MATCH_THRESHOLD:
         logger.info(
             f"find_matching_task_node userId={userId} matched nodeId={matched_id} "
-            f"(confidence={confidence:.2f}) reason={reason!r}"
+            f"match_type={match_type} (confidence={confidence:.2f}) reason={reason!r}"
         )
-        return matched_id
+        return {
+            "node_id": matched_id,
+            "match_type": match_type,
+            "confidence": confidence,
+            "sub_domain": by_id[matched_id]["sub_domain"] or "",
+        }
 
+    logger.info(
+        f"find_matching_task_node userId={userId} no match accepted "
+        f"(llm matched_id={matched_id!r} match_type={match_type} confidence={confidence:.2f} "
+        f"threshold={TASK_MATCH_THRESHOLD}) reason={reason!r}"
+    )
     return None
 
 
@@ -1220,7 +1779,13 @@ def find_matching_task_node(userId: str, text: str, domain: str) -> Optional[str
 # FUNCTION 5B: process_memory_intent
 # ================================================================
 
-def process_memory_intent(userId: str, text: str, memoryId: Optional[str] = None) -> dict:
+def process_memory_intent(
+    userId: str,
+    text: str,
+    memoryId: Optional[str] = None,
+    extracted_metadata: Optional[Dict[str, Any]] = None,
+    extraction_fallback: bool = False,
+) -> dict:
     """
     Single entry point for turning a raw memory text into a graph mutation.
     This replaces calling extract_graph_metadata() + add_to_graph() directly
@@ -1232,12 +1797,33 @@ def process_memory_intent(userId: str, text: str, memoryId: Optional[str] = None
         → skip entirely. Never calls extract_graph_metadata() or writes
         anything — this is what stops e.g. "What are my pending reminders?"
         from being stored as if it were a fact.
-      - the text reports completion of an existing "ongoing" node → update
-        its status to "completed" instead of creating a new node.
-      - the text closely matches an existing "ongoing" node (duplicate
-        mention of the same task/fact) → refresh its last_updated timestamp
-        instead of creating a duplicate node.
+      - the text reports completion of an existing "ongoing" task
+        (match_type="progression", status="completed") → update_node_status()
+        to "completed"; the task's content is unchanged.
+      - the text revises an existing fact slot (match_type="revision") →
+        a NEW node is created for the new value, and the matched node is
+        archived as history via supersede_node() (superseded_by -> new node,
+        supersede_reason='revision'). Both nodes remain. Current-state reads
+        see only the new one; get_timeline_summary() shows the chain.
+      - the text re-mentions an ongoing TASK with new detail
+        (match_type="progression", status="ongoing") → update_node_content()
+        edits that task node in place.
       - otherwise → create a new node via add_to_graph(), as before.
+
+    `extracted_metadata`, when provided, is this fact's raw classification
+    from atomic_extractor.extract_facts_with_metadata(), which split and
+    classified the whole message in one call (so sibling facts were judged
+    together). It is validated by normalize_graph_metadata() and no second
+    LLM call is made. When None (e.g. /graph/process, or the extractor fell
+    back), extract_graph_metadata() classifies the fact on its own.
+
+    `extraction_fallback` is True when atomic_extractor fell back to the
+    whole, unsplit message. That, or a failed per-fact classification
+    (extract_graph_metadata() returned defaults), is DEGRADED input:
+    matching and supersession are skipped entirely and a plain node is
+    created with needs_reprocessing=TRUE, so a failed extraction can never
+    archive or edit an existing node. A backfill can find these via the
+    needs_reprocessing index and re-run them once extraction works.
 
     `memoryId`, when provided by the caller, is used as the new node's id so
     it stays in sync with the corresponding ChromaDB memory id (matching the
@@ -1252,10 +1838,18 @@ def process_memory_intent(userId: str, text: str, memoryId: Optional[str] = None
 
     Returns:
         {
-            "action": "skipped" | "updated" | "created",
-            "node_id": Optional[str],  # None when action == "skipped"
+            "action": "skipped" | "updated" | "superseded" | "created",
+            "degraded": bool,          # True → written from fallback metadata, no matching done
+            "node_id": Optional[str],  # the node now holding this fact; None when skipped
+            "match_type": "progression" | "revision" | None,
             "metadata": dict,          # {} when action == "skipped"
             "success": bool,           # whether the underlying DB write succeeded
+            # only when action == "superseded" — enough for a caller to say
+            # "Updated: you were a fan of Rohit Sharma, now it's Virat Kohli":
+            "supersession": {
+                "old": {"node_id", "text", "entity_name"},
+                "new": {"node_id", "text", "entity_name"},
+            },
         }
     """
     if not is_declarative(text):
@@ -1263,36 +1857,121 @@ def process_memory_intent(userId: str, text: str, memoryId: Optional[str] = None
             f"process_memory_intent userId={userId} skipped — text is a "
             f"question, not a fact/task: {text[:80]!r}"
         )
-        return {"action": "skipped", "node_id": None, "metadata": {}, "success": True}
+        return {"action": "skipped", "node_id": None, "match_type": None, "metadata": {}, "success": True, "degraded": False}
 
-    metadata = extract_graph_metadata(text, userId)
+    if extracted_metadata and not extraction_fallback:
+        metadata = normalize_graph_metadata(extracted_metadata, text, userId)
+    else:
+        metadata = extract_graph_metadata(text, userId)
     domain = metadata.get("domain", "general")
     status = metadata.get("status", "ongoing")
+    node_id = memoryId or f"{userId}_{int(datetime.now().timestamp())}_{uuid.uuid4().hex[:8]}"
+
+    # FALLBACK GUARD: never match, supersede or progress on degraded input.
+    # Matching an unsplit compound message or default "general" metadata
+    # against real nodes archived the wrong node in testing (a football fact
+    # superseded the cricket one). A plain, flagged node loses nothing.
+    degraded = extraction_fallback or bool(metadata.pop("extraction_failed", False))
+    if degraded:
+        metadata["needs_reprocessing"] = True
+        success = add_to_graph(userId=userId, node_id=node_id, text=text, metadata=metadata)
+        logger.warning(
+            f"process_memory_intent userId={userId} DEGRADED extraction "
+            f"(extractor_fallback={extraction_fallback}) — created nodeId={node_id} "
+            f"with needs_reprocessing=TRUE, no matching. text={text[:80]!r}"
+        )
+        return {"action": "created", "node_id": node_id, "match_type": None,
+                "metadata": metadata, "success": success, "degraded": True}
+
+    match = find_matching_task_node(userId, text, domain)
+
+    if match and match["match_type"] == "revision":
+        # A fact slot got a new value. The old value is history, not an
+        # error: keep it, archived, and put the new value in its own node.
+        # New node first — superseded_by is a foreign key to it.
+        old_id = match["node_id"]
+        # A revision is the SAME slot by definition, so the new node keeps the
+        # slot identity the old one recorded. The revising message is often
+        # vaguer ("my favorite player is now Kohli" drops "cricket"); without
+        # this the qualifier is lost, and a later "favorite football player"
+        # fact looks like a revision of the now-unqualified slot.
+        if match.get("sub_domain"):
+            if metadata.get("sub_domain") and metadata["sub_domain"] != match["sub_domain"]:
+                logger.info(
+                    f"process_memory_intent userId={userId} revision keeps slot "
+                    f"sub_domain={match['sub_domain']!r} (message gave {metadata['sub_domain']!r})"
+                )
+            metadata["sub_domain"] = match["sub_domain"]
+        created = add_to_graph(
+            userId=userId, node_id=node_id, text=text, metadata=metadata,
+            exclude_related_ids=[old_id],
+        )
+        old = supersede_node(userId, old_id, node_id) if created else None
+        success = created and old is not None
+        new_info = {
+            "node_id": node_id,
+            "text": text,
+            "entity_name": metadata.get("entity_name", text[:60]),
+        }
+        logger.info(
+            f"process_memory_intent userId={userId} revision: {old_id} superseded by "
+            f"{node_id} success={success} old_text={(old or {}).get('text')!r} new_text={text!r}"
+        )
+        if not success:
+            # The new node may exist without the old one archived; report it as
+            # a plain create so callers don't claim a supersession that didn't
+            # happen.
+            return {"action": "created" if created else "failed", "node_id": node_id if created else None,
+                    "match_type": "revision", "metadata": metadata, "success": created, "degraded": False}
+        return {
+            "action": "superseded",
+            "node_id": node_id,
+            "match_type": "revision",
+            "metadata": metadata,
+            "success": True,
+            "degraded": False,
+            "supersession": {"old": old, "new": new_info},
+        }
+
+    if match:
+        matched_id = match["node_id"]
+        if status == "completed":
+            # Task finished — its content (the task) is unchanged, only its
+            # status moves forward.
+            success = update_node_status(userId, matched_id, "completed")
+        else:
+            # The same ongoing task mentioned again with new detail — an
+            # in-place edit of the task node is right here.
+            success = update_node_content(
+                userId,
+                matched_id,
+                new_text=text,
+                new_entity_name=metadata.get("entity_name", text[:60]),
+                new_metadata=metadata,
+            )
+
+        logger.info(
+            f"process_memory_intent userId={userId} matched nodeId={matched_id} "
+            f"match_type=progression status={status} success={success}"
+        )
+        return {
+            "action": "updated",
+            "node_id": matched_id,
+            "match_type": "progression",
+            "metadata": metadata,
+            "success": success,
+            "degraded": False,
+        }
 
     if status == "completed":
-        matched_id = find_matching_task_node(userId, text, domain)
-        if matched_id:
-            success = update_node_status(userId, matched_id, "completed")
-            return {"action": "updated", "node_id": matched_id, "metadata": metadata, "success": success}
-
         logger.warning(
             f"process_memory_intent userId={userId} reported a completion with no "
             f"matching prior ongoing task — creating a new node. text={text[:80]!r}"
         )
 
-    elif status == "ongoing":
-        matched_id = find_matching_task_node(userId, text, domain)
-        if matched_id:
-            success = update_node_status(userId, matched_id, "ongoing")
-            logger.info(
-                f"process_memory_intent userId={userId} duplicate ongoing task matched "
-                f"nodeId={matched_id} — refreshed instead of creating a new node"
-            )
-            return {"action": "updated", "node_id": matched_id, "metadata": metadata, "success": success}
-
-    node_id = memoryId or f"{userId}_{int(datetime.now().timestamp())}_{uuid.uuid4().hex[:8]}"
     success = add_to_graph(userId=userId, node_id=node_id, text=text, metadata=metadata)
-    return {"action": "created", "node_id": node_id, "metadata": metadata, "success": success}
+    return {"action": "created", "node_id": node_id, "match_type": None, "metadata": metadata,
+            "success": success, "degraded": False}
 
 
 # ================================================================
@@ -1331,7 +2010,15 @@ def _cluster_nodes_via_llm(nodes: List[dict]) -> List[List[str]]:
         "different status stages (e.g. one node says \"applying for the "
         "job\" and another says \"got the offer\" — these are the same "
         "underlying task at different points in time, so they belong in "
-        "the same group).\n\n"
+        "the same group). A single-value fact slot with an old and a new "
+        "value is also one group (e.g. \"favorite cricket player is Rohit "
+        "Sharma\" and \"favorite cricket player is Virat Kohli\").\n\n"
+        "Do NOT group nodes that are merely in the same area but describe "
+        "DIFFERENT slots, tasks, or entities that can all be true at once. "
+        "For example, \"favorite cricket player is Virat Kohli\", \"prefers "
+        "Messi for football\" and \"prefers Federer for tennis\" are three "
+        "separate facts. Grouping them would delete true information. When "
+        "in doubt, leave nodes ungrouped.\n\n"
         "Nodes:\n"
         f"{listing}\n\n"
         "Return ONLY a JSON object:\n"
@@ -1342,7 +2029,7 @@ def _cluster_nodes_via_llm(nodes: List[dict]) -> List[List[str]]:
     )
 
     try:
-        raw = ai_service.call_llm(message=prompt, context="")
+        raw = ai_service.call_llm(message=prompt, context="", for_chat=False)
         parsed = safe_parse_json(raw)
         raw_clusters = parsed.get("clusters", [])
         if not isinstance(raw_clusters, list):
@@ -1434,6 +2121,7 @@ async def resolve_conflicting_nodes(
                 SELECT id, entity_name, text, status, created_at
                 FROM graph_nodes
                 WHERE user_id = %s AND domain = %s AND superseded_by IS NULL
+                  AND needs_reprocessing IS NOT TRUE
                 ORDER BY created_at DESC
             """
             params: List[Any] = [userId, d]
@@ -1460,14 +2148,7 @@ async def resolve_conflicting_nodes(
                 if not other_ids:
                     continue
 
-                cur.execute(
-                    """
-                    UPDATE graph_nodes
-                    SET superseded_by = %s, archived_at = NOW()
-                    WHERE id = ANY(%s) AND user_id = %s
-                    """,
-                    (active["id"], other_ids, userId),
-                )
+                _mark_superseded(cur, userId, other_ids, active["id"], "merge")
                 conn.commit()
 
                 summary["clusters_found"] += 1
@@ -1584,7 +2265,7 @@ def delete_user_graph(userId: str) -> dict:
 # FUNCTION 6: get_timeline_summary
 # ================================================================
 
-def get_timeline_summary(userId: str) -> dict:
+def get_timeline_summary(userId: str, domain: Optional[str] = None) -> dict:
     """
     Return all memories grouped by month → domain → ongoing/completed.
 
@@ -1594,6 +2275,17 @@ def get_timeline_summary(userId: str) -> dict:
     node's original month/status stays visible (e.g. "this task started in
     June, was consolidated into a later node in July") instead of vanishing.
 
+    Archived entries are labelled with what replaced them, so a revised fact
+    reads as history rather than as a duplicate next to its successor:
+      - supersede_reason 'revision' → "Rohit Sharma (replaced by Virat Kohli)"
+      - supersede_reason 'merge'    → "<name> (merged into <name>)"
+      - archived before supersede_reason existed → "<name> (archived, see <name>)"
+
+    `domain`, if given, limits the result to that one domain. The full
+    timeline grows without limit; this is a view of complete history (for the
+    /graph/timeline endpoint or a UI), never chat context — chat uses the
+    bounded get_history_context().
+
     Example: {"June 2026": {"job": {"ongoing": [...], "completed": [...]}}}
     """
     conn = _get_connection()
@@ -1601,13 +2293,16 @@ def get_timeline_summary(userId: str) -> dict:
         cur = conn.cursor()
         cur.execute(
             """
-            SELECT timeline_label, timeline_year, timeline_month,
-                   domain, status, entity_name, text
-            FROM graph_nodes
-            WHERE user_id = %s
-            ORDER BY timeline_year DESC, timeline_month DESC, domain ASC
+            SELECT g.timeline_label, g.timeline_year, g.timeline_month,
+                   g.domain, g.status, g.entity_name, g.text,
+                   g.superseded_by, g.supersede_reason,
+                   s.entity_name AS successor_entity, s.text AS successor_text
+            FROM graph_nodes g
+            LEFT JOIN graph_nodes s ON s.id = g.superseded_by
+            WHERE g.user_id = %s AND (%s::varchar IS NULL OR g.domain = %s)
+            ORDER BY g.timeline_year DESC, g.timeline_month DESC, g.domain ASC, g.created_at ASC
             """,
-            (userId,),
+            (userId, domain, domain),
         )
         rows = cur.fetchall()
         cur.close()
@@ -1618,6 +2313,12 @@ def get_timeline_summary(userId: str) -> dict:
             domain = row["domain"] or "general"
             status = row["status"] or "ongoing"
             name = row["entity_name"] or (row["text"] or "")[:60]
+            if row["superseded_by"]:
+                successor = row["successor_entity"] or (row["successor_text"] or "")[:60]
+                how = {"revision": "replaced by", "merge": "merged into"}.get(
+                    row["supersede_reason"], "archived, see"
+                )
+                name = f"{name} ({how} {successor})"
 
             if label not in result:
                 result[label] = {}

@@ -41,7 +41,7 @@ LLM_MODEL: str = GROQ_MODEL
 # metadata extraction, atomic fact splitting) that don't need the large
 # model's reasoning capacity — only ai/chat's conversational response
 # keeps using LLM_MODEL.
-FAST_LLM_MODEL: str = os.getenv("FAST_LLM_MODEL", "llama-3.1-8b-instant")
+FAST_LLM_MODEL: str = os.getenv("FAST_LLM_MODEL", "openai/gpt-oss-20b")
 
 # Maximum number of tokens the LLM is allowed to generate in one response.
 # 1024 tokens ≈ 750 words — plenty for conversational replies.

@@ -126,7 +126,7 @@ async def graph_process_endpoint(
         # this response. Only "created" needs this: "updated" already went
         # through the write-time dedup check, so it can't have just
         # introduced a new duplicate.
-        if result["action"] == "created":
+        if result["action"] == "created" and not result.get("degraded"):
             background_tasks.add_task(
                 graph_memory.resolve_conflicting_nodes,
                 body.userId,
@@ -198,12 +198,87 @@ async def graph_context_endpoint(
 
 
 # ================================================================
+# ENDPOINT 2B: GET /graph/summary/{userId}
+# Returns the most recently generated rolling summary (see
+# summarization.py / scheduler.py — Task 1's background job), if one
+# exists yet. Intended to be folded into /ai/chat's long-term-memory
+# context alongside ChromaDB retrieval and graph_context_text.
+# ================================================================
+@router.get("/summary/{userId}")
+async def graph_summary_endpoint(
+    userId: str,
+    authorization: Optional[str] = Header(default=None),
+):
+    """
+    Return the latest user_summaries row for a user, or hasSummary=false if
+    the background summarization job hasn't produced one yet (e.g. brand
+    new user, or not enough low-load time has passed since they had enough
+    memories to summarize). Never an error — an absent summary is a normal,
+    expected state, not a failure.
+    """
+    _require_auth(authorization)
+    logger.info(f"graph_summary  userId={userId}")
+
+    try:
+        from summarization import get_latest_summary
+
+        summary = get_latest_summary(userId)
+        if not summary:
+            return {"userId": userId, "hasSummary": False, "summary": None}
+
+        return {
+            "userId": userId,
+            "hasSummary": True,
+            "summary": summary["summary_text"],
+            "generatedAt": summary["generated_at"].isoformat(),
+            "sourceNodeCount": summary["source_node_count"],
+        }
+
+    except Exception as e:
+        logger.error(f"graph_summary failed userId={userId}: {e}")
+        raise HTTPException(status_code=503, detail=f"Summary unavailable: {str(e)}")
+
+
+# ================================================================
 # ENDPOINT 3: GET /graph/timeline/{userId}
 # Returns all memories grouped by month → domain → status.
 # ================================================================
+@router.get("/history/{userId}")
+async def graph_history_endpoint(
+    userId: str,
+    query: Optional[str] = None,
+    domain: Optional[str] = None,
+    limit: int = graph_memory.HISTORY_CONTEXT_LIMIT,
+    authorization: Optional[str] = Header(default=None),
+):
+    """
+    Bounded revision history ("previously Rohit Sharma, replaced by Virat
+    Kohli") for a history-flavoured chat message. Spring calls this only when
+    its HistoryQuestionUtil flags the message. Scoped to `domain`, or to the
+    domain of `query`, falling back to the most recently changed slots; at
+    most `limit` (capped at 20) chains. See graph_memory.get_history_context().
+    """
+    _require_auth(authorization)
+    logger.info(f"graph_history  userId={userId}  domain={domain}  limit={limit}")
+    try:
+        result = graph_memory.get_history_context(
+            userId, query_text=query, domain=domain, limit=max(1, min(limit, 20))
+        )
+        return {
+            "userId": userId,
+            "domain": result["domain"],
+            "count": len(result["chains"]),
+            "history_context_text": result["history_context_text"],
+        }
+    except Exception as e:
+        logger.error(f"graph_history failed userId={userId}: {e}")
+        raise HTTPException(status_code=503, detail=f"History unavailable: {str(e)}")
+
+
 @router.get("/timeline/{userId}")
 async def graph_timeline_endpoint(
     userId: str,
+    domain: Optional[str] = None,
     authorization: Optional[str] = Header(default=None),
 ):
     """
@@ -217,8 +292,8 @@ async def graph_timeline_endpoint(
     logger.info(f"graph_timeline  userId={userId}")
 
     try:
-        summary = graph_memory.get_timeline_summary(userId)
-        return {"userId": userId, "timeline": summary}
+        summary = graph_memory.get_timeline_summary(userId, domain=domain)
+        return {"userId": userId, "domain": domain, "timeline": summary}
 
     except Exception as e:
         logger.error(f"graph_timeline failed: {e}")

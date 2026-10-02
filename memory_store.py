@@ -203,6 +203,7 @@ def retrieve_memories(
         query_embeddings=[query_embedding],
         n_results=effective_n_results,
         where=where_clause,
+        include=["documents", "distances", "metadatas"],
     )
 
     # Step 3: Extract the document and distance arrays from ChromaDB's response.
@@ -211,12 +212,18 @@ def retrieve_memories(
     # gets the results for our single query, ordered most-to-least similar.
     documents = results.get("documents", [[]])[0]
     distances = results.get("distances", [[]])[0]
+    metadatas = results.get("metadatas", [[]])[0] or [{}] * len(documents)
 
     # Step 4: Filter out weak matches — a memory is only relevant context if
     # it's actually close to the query, not just the least-bad option available.
+    # Superseded entries (an older value of a revised fact, see
+    # mark_memory_superseded) are history, never current context. This is
+    # filtered here rather than in `where`: a Chroma `$ne`/`$exists`-style
+    # clause would also drop every entry that simply lacks the key, which is
+    # all of them before this flag existed.
     filtered_docs = [
-        doc for doc, dist in zip(documents, distances)
-        if dist < RELEVANCE_THRESHOLD
+        doc for doc, dist, meta in zip(documents, distances, metadatas)
+        if dist < RELEVANCE_THRESHOLD and not (meta or {}).get("superseded_by")
     ]
 
     logger.info(
@@ -253,6 +260,37 @@ def update_memory_domain(memory_id: str, domain: str) -> bool:
         return True
     except Exception as e:
         logger.warning(f"update_memory_domain failed memoryId={memory_id}: {e}")
+        return False
+
+
+def mark_memory_superseded(userId: str, old_memory_id: str, new_memory_id: str) -> bool:
+    """
+    Flag the Chroma entry holding a fact's OLD value as superseded, after
+    graph_memory.supersede_node() archived its graph node (a "revision").
+
+    The entry is kept (history), but retrieve_memories() skips any entry
+    with `superseded_by` set, so the stale value can't be returned as current
+    context. Every graph node shares its id with the Chroma entry that
+    created it, so old_memory_id is simply the archived node's id.
+
+    Only entries owned by userId are touched. Returns True if the flag was
+    written. Never raises — it runs in a background task.
+    """
+    try:
+        existing = _collection.get(ids=[old_memory_id], include=["metadatas"])
+        metas = existing.get("metadatas") or []
+        if not metas or (metas[0] or {}).get("userId") != userId:
+            logger.warning(
+                f"mark_memory_superseded userId={userId} entry {old_memory_id} not found for this user"
+            )
+            return False
+        _collection.update(ids=[old_memory_id], metadatas=[{"superseded_by": new_memory_id}])
+        logger.info(
+            f"mark_memory_superseded userId={userId} {old_memory_id} superseded_by={new_memory_id}"
+        )
+        return True
+    except Exception as e:
+        logger.warning(f"mark_memory_superseded failed userId={userId} id={old_memory_id}: {e}")
         return False
 
 
@@ -300,6 +338,7 @@ def get_all_memories(userId: str) -> List[dict]:
             "role": meta.get("role", ""),
             "sessionId": meta.get("sessionId", ""),
             "timestamp": meta.get("timestamp", 0),
+            "supersededBy": meta.get("superseded_by"),
         }
         for doc, meta in zip(documents, metadatas)
     ]

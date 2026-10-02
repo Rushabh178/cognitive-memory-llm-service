@@ -38,7 +38,8 @@ import embeddings
 import memory_store
 import ai_service
 import graph_routes
-from atomic_extractor import extract_atomic_facts, is_fact_worth_storing
+import scheduler
+from atomic_extractor import drop_question_sentences, extract_facts_with_metadata, is_fact_worth_storing
 from models import (
     MemoryStoreRequest,
     MemoryStoreResponse,
@@ -98,9 +99,15 @@ async def lifespan(app: FastAPI):
         logger.error(f"Graph table init failed: {e}")
         # Don't crash startup — graph is not on the critical path
 
+    # Background summarization scheduler (Task 1) — in-process, no broker.
+    # Never blocks startup or the request path; see scheduler.py for the
+    # low-load gating that decides when it's actually allowed to do work.
+    scheduler.start()
+
     yield  # Server is now running and accepting requests
 
     # --- SHUTDOWN ---
+    scheduler.shutdown()
     logger.info("Server shutting down.")
 
 
@@ -148,8 +155,16 @@ async def log_requests(request: Request, call_next):
     # Log the incoming request
     logger.info(f"REQUEST  {request.method} {request.url.path}")
 
-    # Pass the request to the actual endpoint handler
-    response = await call_next(request)
+    # Track this request as "in flight" for the summarization scheduler's
+    # low-load gate (scheduler.is_low_load()) — incremented/decremented
+    # around every request regardless of path, so it reflects total service
+    # load, not just chat traffic.
+    scheduler.mark_request_start()
+    try:
+        # Pass the request to the actual endpoint handler
+        response = await call_next(request)
+    finally:
+        scheduler.mark_request_end()
 
     # Calculate how long the endpoint took in milliseconds
     elapsed_ms = (time.time() - start_time) * 1000
@@ -199,20 +214,49 @@ async def store_memory_endpoint(
 
     # Log which user is storing a memory (useful for debugging)
     logger.info(f"store_memory  userId={body.userId}  role={body.role}")
+    scheduler.mark_user_active(body.userId)
 
     try:
         # Step 1: Split compound user statements into individual atomic facts
         # ("My name is Rushabh and I work at Yardi" → two facts) so each one
         # can be retrieved precisely later instead of pulling in a whole
-        # sentence to get part of it. Assistant responses are stored verbatim
-        # — they're conversational text, not a set of facts to decompose.
+        # sentence to get part of it. The same LLM call also classifies each
+        # fact (domain/status/importance...) with the whole message as
+        # context, so sibling facts are judged consistently; that metadata is
+        # handed to the background graph task below instead of a second LLM
+        # call per fact. Assistant responses are stored verbatim — they're
+        # conversational text, not a set of facts to decompose.
+        fact_metadata: list = []
         if body.role == "user":
-            facts = extract_atomic_facts(body.text)
+            extracted = extract_facts_with_metadata(body.text)
+
+            # If extraction failed, the fallback item is the whole raw message.
+            # Never store a question from it as a "fact" — keep only its
+            # statements (a successful extraction already drops questions).
+            # A stored question is later retrieved as a past memory with no
+            # answer, and the model treats it as an open question.
+            cleaned = []
+            for item in extracted:
+                if item["fallback"]:
+                    statements = drop_question_sentences(item["text"])
+                    if statements != item["text"]:
+                        logger.info(
+                            f"Extraction fallback for userId={body.userId}: dropped question "
+                            f"sentence(s); keeping {statements!r}"
+                        )
+                    if not statements:
+                        continue
+                    item = {**item, "text": statements}
+                cleaned.append(item)
+            extracted = cleaned
 
             # Filter out low-quality fragments that survived extraction —
             # too short to carry meaning on their own, or meta-cognitive
             # statements about the conversation rather than facts about the user.
-            facts = [f for f in facts if is_fact_worth_storing(f)]
+            extracted = [item for item in extracted if is_fact_worth_storing(item["text"])]
+            facts = [item["text"] for item in extracted]
+            fact_metadata = [item["metadata"] for item in extracted]
+            fact_fallback = [item["fallback"] for item in extracted]
 
             if not facts:
                 logger.info(
@@ -267,6 +311,8 @@ async def store_memory_endpoint(
                     body.userId,
                     fact,
                     stored_ids[index],
+                    fact_metadata[index],
+                    fact_fallback[index],
                 )
 
         # Step 5: Return success response with every generated ID.
@@ -295,6 +341,7 @@ async def retrieve_memory_endpoint(
     require_auth(authorization)
 
     logger.info(f"retrieve_memory  userId={body.userId}  topK={body.topK}")
+    scheduler.mark_user_active(body.userId)
 
     try:
         # Step 1: Take the query string from the request body.
@@ -399,12 +446,15 @@ async def clear_memory_endpoint(
 async def process_graph_background(
     userId: str,
     text: str,
-    memory_id: str
+    memory_id: str,
+    extracted_metadata: Optional[dict] = None,
+    extraction_fallback: bool = False,
 ) -> None:
     """
     Runs after the /memory/store response is already sent to the caller, once
-    per atomic fact. Extracts graph metadata and stores the node.
-    Failure here never affects the user.
+    per atomic fact. Writes the fact to the graph using the metadata the
+    extractor already produced for it (extracted_metadata), or classifies it
+    here if that's None. Failure here never affects the user.
     """
     try:
         logger.info(
@@ -417,7 +467,9 @@ async def process_graph_background(
             CONFLICT_RESOLUTION_TRIGGER_LIMIT,
         )
 
-        result = process_memory_intent(userId, text, memory_id)
+        result = process_memory_intent(
+            userId, text, memory_id, extracted_metadata, extraction_fallback
+        )
         metadata = result["metadata"]
 
         # process_memory_intent() runs the is_declarative() gate itself
@@ -433,18 +485,33 @@ async def process_graph_background(
         # Patch the domain this extraction just resolved onto the ChromaDB
         # entry for THIS memory_id — not result["node_id"], which for
         # action="updated" is an older, matched graph node, not the fact we
-        # just stored. This is what makes the memory domain-filterable in
+        # just stored (for "created"/"superseded" the two are the same id). This is what makes the memory domain-filterable in
         # retrieve_memories(); it wasn't known yet when store_memory() wrote
         # it, since that call happens before this background task runs.
         domain = metadata.get("domain", "general")
         memory_store.update_memory_domain(memory_id, domain)
 
+        # A revision: this fact superseded an older value of the same slot,
+        # whose graph node is now archived as history. Flag the old value's
+        # Chroma entry the same way (kept, not deleted), so /memory/retrieve
+        # stops returning it as current context.
+        if result["action"] == "superseded":
+            old = result["supersession"]["old"]
+            memory_store.mark_memory_superseded(userId, old["node_id"], memory_id)
+            logger.info(
+                f"Fact superseded userId={userId} "
+                f"old={old['entity_name'] or old['text']!r} -> "
+                f"new={result['supersession']['new']['entity_name']!r}"
+            )
+
         # We're already running off the main request/response path (this
         # function only runs after the chat response has been sent), so a
         # direct await here adds no latency the user can see. Only "created"
-        # can have just introduced a new duplicate — "updated" already went
-        # through the write-time dedup check.
-        if result["action"] == "created":
+        # can have just introduced a new duplicate — "updated" and
+        # "superseded" already went through the write-time match.
+        # A degraded (fallback-metadata) node never enters the merge pass:
+        # clustering unreliable data could archive real nodes into it.
+        if result["action"] == "created" and not result.get("degraded"):
             await resolve_conflicting_nodes(
                 userId,
                 metadata.get("domain", "general"),
@@ -486,6 +553,7 @@ async def ai_chat_endpoint(
         f"ai_chat  userId={body.userId}  "
         f"context={'yes' if has_context else 'no'}"
     )
+    scheduler.mark_user_active(body.userId)
     logger.info(f"DEBUG ai_chat_full_context userId={body.userId} context={body.context!r}")
 
     try:
@@ -498,6 +566,7 @@ async def ai_chat_endpoint(
         answer = ai_service.call_llm(
             message=body.message,
             context=body.context,
+            session_history=[turn.model_dump() for turn in body.sessionHistory],
         )
 
         logger.info(f"ai_chat response generated for userId={body.userId}")
